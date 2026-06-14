@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black">
+
+    <SurfaceView
+        android:id="@+id/surface"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
+
+    <!-- Connection overlay; hidden once streaming, tap screen to reveal -->
+    <LinearLayout
+        android:id="@+id/overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:background="#CC000000">
+
+        <EditText
+            android:id="@+id/host"
+            android:layout_width="280dp"
+            android:layout_height="wrap_content"
+            android:textColor="@android:color/white"
+            android:textColorHint="#888888"
+            android:hint="@string/host_hint"
+            android:inputType="text"
+            android:text="127.0.0.1" />
+
+        <EditText
+            android:id="@+id/port"
+            android:layout_width="280dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="@android:color/white"
+            android:textColorHint="#888888"
+            android:hint="@string/port_hint"
+            android:inputType="number"
+            android:text="5000" />
+
+        <Button
+            android:id="@+id/connect"
+            android:layout_width="280dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/connect" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="280dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textColor="#AAAAAA"
+            android:textSize="12sp"
+            android:text="" />
+    </LinearLayout>
+</FrameLayout>

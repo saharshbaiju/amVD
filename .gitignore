@@ -1,0 +1,25 @@
+# --- Android / Gradle ---
+android/build/
+android/app/build/
+android/.gradle/
+# machine-specific (sdk.dir); regenerate per machine
+android/local.properties
+android/.idea/
+android/*.iml
+android/app/*.iml
+.cxx/
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- Harness / runtime ---
+.claude/
+
+# --- Editor / OS ---
+*.swp
+.DS_Store
+
+# --- Runtime artifacts ---
+*.log
+/tmp/
