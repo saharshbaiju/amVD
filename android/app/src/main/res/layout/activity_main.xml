@@ -2,59 +2,367 @@
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@android:color/black">
+    android:background="@color/bg">
 
+    <!-- The video. Always full-bleed; nothing persistent ever covers it. -->
     <SurfaceView
         android:id="@+id/surface"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:layout_gravity="center" />
 
-    <!-- Connection overlay; hidden once streaming, tap screen to reveal -->
-    <LinearLayout
-        android:id="@+id/overlay"
+    <!-- ============================ CONNECT SCREEN (idle) ============================ -->
+    <FrameLayout
+        android:id="@+id/connectScreen"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@drawable/bg_backdrop">
+
+        <!-- decorative vertical watermark on the far right -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="end|center_vertical"
+            android:rotation="90"
+            android:text="EXT·1"
+            android:textColor="#0DFFFFFF"
+            android:textSize="120sp"
+            android:textStyle="bold"
+            android:fontFamily="sans-serif-light"
+            android:letterSpacing="0.08" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="horizontal"
+            android:paddingHorizontal="56dp"
+            android:paddingVertical="36dp"
+            android:baselineAligned="false">
+
+            <!-- left: branding -->
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="ARCH · SCREEN · EXTENDER"
+                    android:textColor="@color/teal"
+                    android:textSize="11sp"
+                    android:fontFamily="monospace"
+                    android:letterSpacing="0.32" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="20dp"
+                    android:text="Extend"
+                    android:textColor="@color/ink"
+                    android:textSize="46sp"
+                    android:fontFamily="sans-serif-light"
+                    android:letterSpacing="-0.02"
+                    android:includeFontPadding="false" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="everything."
+                    android:textColor="@color/amber"
+                    android:textSize="46sp"
+                    android:fontFamily="sans-serif-light"
+                    android:letterSpacing="-0.02"
+                    android:includeFontPadding="false" />
+
+                <TextView
+                    android:layout_width="280dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="18dp"
+                    android:text="Your Arch / Hyprland desktop, streamed here as a second monitor."
+                    android:textColor="@color/muted"
+                    android:textSize="13sp"
+                    android:lineSpacingExtra="3dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="28dp"
+                    android:text="USB · 127.0.0.1      WI-FI · LAN IP"
+                    android:textColor="#5A6065"
+                    android:textSize="11sp"
+                    android:fontFamily="monospace"
+                    android:letterSpacing="0.12" />
+            </LinearLayout>
+
+            <!-- right: connection card -->
+            <LinearLayout
+                android:id="@+id/connectCard"
+                android:layout_width="320dp"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_vertical"
+                android:orientation="vertical"
+                android:background="@drawable/panel_glass"
+                android:padding="24dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="CONNECT TO HOST"
+                    android:textColor="@color/muted"
+                    android:textSize="10sp"
+                    android:fontFamily="monospace"
+                    android:letterSpacing="0.28" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="HOST"
+                    android:textColor="#6A7075"
+                    android:textSize="10sp"
+                    android:fontFamily="monospace"
+                    android:letterSpacing="0.2" />
+
+                <EditText
+                    android:id="@+id/host"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="6dp"
+                    android:background="@drawable/field_bg"
+                    android:paddingHorizontal="14dp"
+                    android:textColor="@color/ink"
+                    android:textColorHint="#5A6065"
+                    android:hint="127.0.0.1"
+                    android:inputType="text"
+                    android:fontFamily="monospace"
+                    android:textSize="15sp"
+                    android:maxLines="1"
+                    android:text="127.0.0.1" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="14dp"
+                    android:text="PORT"
+                    android:textColor="#6A7075"
+                    android:textSize="10sp"
+                    android:fontFamily="monospace"
+                    android:letterSpacing="0.2" />
+
+                <EditText
+                    android:id="@+id/port"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="6dp"
+                    android:background="@drawable/field_bg"
+                    android:paddingHorizontal="14dp"
+                    android:textColor="@color/ink"
+                    android:textColorHint="#5A6065"
+                    android:hint="5000"
+                    android:inputType="number"
+                    android:fontFamily="monospace"
+                    android:textSize="15sp"
+                    android:maxLines="1"
+                    android:text="5000" />
+
+                <Button
+                    android:id="@+id/connectBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="50dp"
+                    android:layout_marginTop="20dp"
+                    android:background="@drawable/btn_primary"
+                    android:backgroundTint="@null"
+                    android:stateListAnimator="@null"
+                    android:text="CONNECT  →"
+                    android:textColor="@color/ink_on_amber"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    android:letterSpacing="0.16" />
+
+                <TextView
+                    android:id="@+id/errorText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:textColor="@color/warn"
+                    android:textSize="11sp"
+                    android:fontFamily="monospace"
+                    android:gravity="center"
+                    android:visibility="gone"
+                    android:text="" />
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- ============================ IN-SESSION HUD ============================ -->
+
+    <!-- dim catcher behind the drawer; only present while the drawer is open -->
+    <View
+        android:id="@+id/scrim"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#80000000"
+        android:visibility="gone" />
+
+    <!-- transient status toast, top-center, auto-dissolves -->
+    <TextView
+        android:id="@+id/statusToast"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="center"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="16dp"
+        android:background="@drawable/toast_bg"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="9dp"
+        android:textColor="@color/amber"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:letterSpacing="0.12"
+        android:textStyle="bold"
+        android:visibility="gone"
+        android:text="● LIVE" />
+
+    <!-- slim edge handle: the only persistent affordance, hugging the right edge -->
+    <LinearLayout
+        android:id="@+id/edgeHandle"
+        android:layout_width="22dp"
+        android:layout_height="64dp"
+        android:layout_gravity="end|center_vertical"
         android:orientation="vertical"
-        android:padding="24dp"
-        android:background="#CC000000">
+        android:gravity="center"
+        android:background="@drawable/handle_bg"
+        android:visibility="gone">
 
-        <EditText
-            android:id="@+id/host"
-            android:layout_width="280dp"
-            android:layout_height="wrap_content"
-            android:textColor="@android:color/white"
-            android:textColorHint="#888888"
-            android:hint="@string/host_hint"
-            android:inputType="text"
-            android:text="127.0.0.1" />
+        <View android:layout_width="3dp" android:layout_height="3dp"
+            android:layout_margin="2dp" android:background="@drawable/grip" />
+        <View android:layout_width="3dp" android:layout_height="3dp"
+            android:layout_margin="2dp" android:background="@drawable/grip" />
+        <View android:layout_width="3dp" android:layout_height="3dp"
+            android:layout_margin="2dp" android:background="@drawable/grip" />
+    </LinearLayout>
 
-        <EditText
-            android:id="@+id/port"
-            android:layout_width="280dp"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:textColor="@android:color/white"
-            android:textColorHint="#888888"
-            android:hint="@string/port_hint"
-            android:inputType="number"
-            android:text="5000" />
-
-        <Button
-            android:id="@+id/connect"
-            android:layout_width="280dp"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/connect" />
+    <!-- control drawer: slides in from the right on demand, closed by default -->
+    <LinearLayout
+        android:id="@+id/controlDrawer"
+        android:layout_width="300dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="end"
+        android:orientation="vertical"
+        android:background="@drawable/drawer_glass"
+        android:paddingHorizontal="26dp"
+        android:paddingVertical="30dp">
 
         <TextView
-            android:id="@+id/status"
-            android:layout_width="280dp"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:textColor="#AAAAAA"
-            android:textSize="12sp"
-            android:text="" />
+            android:text="SESSION"
+            android:textColor="@color/muted"
+            android:textSize="10sp"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.32" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <View
+                android:id="@+id/dot"
+                android:layout_width="9dp"
+                android:layout_height="9dp"
+                android:layout_marginEnd="10dp"
+                android:background="@drawable/live_dot" />
+
+            <TextView
+                android:id="@+id/drawerState"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="LIVE"
+                android:textColor="@color/ink"
+                android:textSize="24sp"
+                android:fontFamily="sans-serif-light"
+                android:letterSpacing="0.04" />
+        </LinearLayout>
+
+        <View android:layout_width="match_parent" android:layout_height="1dp"
+            android:layout_marginVertical="22dp" android:background="@color/hairline" />
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:scrollbars="none"
+            android:fadeScrollbars="false">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <TextView style="@style/HudLabel" android:text="RESOLUTION" />
+                <TextView android:id="@+id/drawerRes" style="@style/HudValue" android:text="—" />
+
+                <TextView style="@style/HudLabel" android:layout_marginTop="16dp" android:text="HOST" />
+                <TextView android:id="@+id/drawerHost" style="@style/HudValue" android:text="—" />
+
+                <TextView style="@style/HudLabel" android:layout_marginTop="16dp" android:text="LINK" />
+                <TextView android:id="@+id/drawerLink" style="@style/HudValue" android:text="—" />
+
+                <!-- Linux desktop settings (from the daemon banner) -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="24dp"
+                    android:text="LINUX DESKTOP"
+                    android:textColor="@color/teal"
+                    android:textSize="10sp"
+                    android:fontFamily="monospace"
+                    android:letterSpacing="0.28" />
+
+                <TextView style="@style/HudLabel" android:layout_marginTop="14dp" android:text="EXTENDED SIDE" />
+                <TextView android:id="@+id/drawerSide" style="@style/HudValue" android:text="—" />
+
+                <TextView style="@style/HudLabel" android:layout_marginTop="16dp" android:text="REFRESH RATE" />
+                <TextView android:id="@+id/drawerFps" style="@style/HudValue" android:text="—" />
+
+                <TextView style="@style/HudLabel" android:layout_marginTop="16dp" android:text="DESKTOP SCALE" />
+                <TextView android:id="@+id/drawerScale" style="@style/HudValue" android:text="—" />
+
+                <TextView style="@style/HudLabel" android:layout_marginTop="16dp" android:text="QUALITY" />
+                <TextView android:id="@+id/drawerQuality" style="@style/HudValue" android:text="—" />
+
+                <TextView style="@style/HudLabel" android:layout_marginTop="16dp" android:text="CODEC" />
+                <TextView android:id="@+id/drawerCodec" style="@style/HudValue" android:text="—" />
+            </LinearLayout>
+        </ScrollView>
+
+        <Button
+            android:id="@+id/disconnectBtn"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:background="@drawable/btn_ghost"
+            android:backgroundTint="@null"
+            android:stateListAnimator="@null"
+            android:text="DISCONNECT"
+            android:textColor="@color/warn"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.16" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="tap outside to dismiss"
+            android:textColor="#5A6065"
+            android:textSize="10sp"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.1"
+            android:gravity="center" />
     </LinearLayout>
 </FrameLayout>

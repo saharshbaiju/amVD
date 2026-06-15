@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#08090A</color>
+    <color name="ink">#F1F3F4</color>
+    <color name="muted">#868D92</color>
+    <color name="amber">#E8B23A</color>
+    <color name="teal">#46BBAC</color>
+    <color name="warn">#E0703A</color>
+    <color name="glass">#E60E1114</color>
+    <color name="glass_strong">#F20C0E11</color>
+    <color name="hairline">#24FFFFFF</color>
+    <color name="field">#12FFFFFF</color>
+    <color name="ink_on_amber">#0A0B0C</color>
+</resources>

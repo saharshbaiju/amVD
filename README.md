@@ -26,7 +26,7 @@ Hyprland headless output (EXT-1)        a genuine GPU-backed secondary monitor;
    extenderd.py                         splits raw Annex-B into NAL units,
         │  caches SPS/PPS, no buffering  starts each client on a keyframe
         │
-   TCP  (USB via adb reverse, or WiFi LAN)
+   TCP  (USB via USB tethering, or WiFi LAN)
         │
    Android app  →  MediaCodec  →  Surface   hardware decode, rendered on arrival,
                                              KEY_LOW_LATENCY, zero jitter buffer
@@ -51,33 +51,62 @@ Target end-to-end latency for this base: **well under 50 ms** on USB / good 5 GH
 
 ```bash
 sudo pacman -S wf-recorder libva-mesa-driver python   # capture + VA-API + daemon
-# adb (for USB):  sudo pacman -S android-tools
+# adb is optional — only for "Match connected phone" auto-sizing (needs USB
+# debugging):  sudo pacman -S android-tools
 ```
 
 Hyprland must be the running compositor (it provides the headless output).
 
-## Run — Linux side
+### USB without USB debugging
 
-USB (most deterministic, recommended for the base):
+The wired path uses **Android USB tethering**, not `adb` — so **no developer
+mode / USB debugging is required**. On the phone, enable
+*Settings → Connections → Mobile Hotspot and Tethering → USB tethering*. The
+phone then hands this PC an address on `192.168.42.0/24`, and the app connects to
+that PC address (the TUI / launcher prints it).
+
+> Note: while USB tethering is on, Linux may route internet through the phone.
+> If that's unwanted, lower that interface's route priority (or turn off the
+> phone's mobile data) — the stream itself only needs the local `192.168.42.x`
+> link, not internet.
+
+## Run — Linux side (TUI, recommended)
 
 ```bash
 cd linux
-./start-extender.sh usb            # sets `adb reverse` + starts the daemon
+./asext            # launches the terminal UI
 ```
 
-WiFi:
+The TUI does everything interactively:
+
+- **Dependencies** — checks for `wf-recorder`, `vainfo`, `adb`, etc. and installs
+  any missing ones with `sudo pacman`. On first run it opens here automatically if
+  a required package is missing.
+- **Detected hardware** — your primary monitor + mode, the VA-API encode node, a
+  USB-connected phone's panel size, and your LAN IP.
+- **Configure** — screen **side** (left/right/up/down), **resolution** (presets or
+  *Match connected phone* over USB), **FPS**, desktop **scale**, **quality**
+  (low/medium/high/ultra → bitrate), **codec**, keyframe interval, **transport**
+  (USB/WiFi), and **port**. Saved to `~/.config/archscreenextender/config.json`.
+- **Start extender** — launches the daemon and shows a live status screen with the
+  exact address to type on the phone (the USB-tether IP for USB, the LAN IP for
+  WiFi).
+
+### Or run the daemon directly (advanced / scripting)
 
 ```bash
 cd linux
+./start-extender.sh usb            # USB tethering: prints the PC tether IP
 ./start-extender.sh wifi           # prints the LAN IP to enter on the phone
 ```
 
 Useful flags (forwarded to `extenderd.py`):
 
 ```
---width 1920 --height 1080 --fps 60     # virtual monitor mode
---bitrate 12M --gop 30                   # encoder bitrate / keyframe interval
---device /dev/dri/renderD128             # VA-API node (AMD iGPU; the default)
+--width 1920 --height 1080 --fps 60          # virtual monitor mode
+--side via --position auto-right|auto-left|auto-up|auto-down
+--bitrate 12M --codec h264|hevc --gop 30     # encoder
+--device /dev/dri/renderD128                 # VA-API node (AMD iGPU; the default)
 --port 5000
 ```
 
@@ -102,7 +131,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 > Gradle/AGP versions), so point `JAVA_HOME` at Android Studio's bundled JBR.
 
 In the app:
-- **USB:** host `127.0.0.1`, port `5000`, Connect. (Run the `usb` launcher first.)
+- **USB:** enable *USB tethering* on the phone, then host = the PC tether IP the
+  launcher printed (a `192.168.42.x`), port `5000`, Connect. No USB debugging.
 - **WiFi:** host = the PC LAN IP the launcher printed, port `5000`, Connect.
 
 Tap the video to bring the connection overlay back.
@@ -111,8 +141,11 @@ Tap the video to bring the connection overlay back.
 
 ```
 linux/
+  asext               TUI launcher (recommended entry point)
+  tui.py              curses UI: deps install, detection, config, live status
+  core.py             config persistence + hardware/dependency detection
   extenderd.py        capture -> encode -> NAL parse -> TCP broadcast
-  start-extender.sh   USB/WiFi launcher
+  start-extender.sh   direct USB/WiFi launcher (advanced)
 android/
   app/src/main/java/com/archextender/
     MainActivity.kt   fullscreen SurfaceView + connect overlay

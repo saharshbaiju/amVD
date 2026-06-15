@@ -1,7 +1,9 @@
 <resources>
     <string name="app_name">Screen Extender</string>
-    <string name="host_hint">Host (127.0.0.1 for USB)</string>
-    <string name="port_hint">Port</string>
+    <string name="subtitle">Connect to your Arch / Hyprland PC</string>
+    <string name="connect_cta">CONNECT  →</string>
+    <string name="host_hint">127.0.0.1</string>
+    <string name="port_hint">5000</string>
     <string name="connect">Connect</string>
     <string name="disconnect">Disconnect</string>
 </resources>
