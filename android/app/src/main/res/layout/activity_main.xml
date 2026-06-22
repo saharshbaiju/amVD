@@ -4,8 +4,9 @@
     android:layout_height="match_parent"
     android:background="@color/bg">
 
-    <!-- The video. Always full-bleed; nothing persistent ever covers it. -->
-    <SurfaceView
+    <!-- The video. Letterboxed to the stream's aspect ratio so it is never
+         stretched; the black margins are true letterbox/pillarbox bars. -->
+    <com.archextender.AspectRatioSurfaceView
         android:id="@+id/surface"
         android:layout_width="match_parent"
         android:layout_height="match_parent"

@@ -137,6 +137,46 @@ In the app:
 
 Tap the video to bring the connection overlay back.
 
+## Developing & debugging
+
+End users need none of this — it's for working on the code.
+
+### Linux daemon
+
+```bash
+cd linux
+./asext                                   # TUI: deps, detection, config, live status
+
+# or run the daemon directly and watch its logs (it logs to stderr, [extenderd] prefix)
+./start-extender.sh wifi                  # or: usb
+```
+
+The daemon prints capture/encode/client events (SPS/PPS caching, keyframe starts,
+client connect/drop, send-queue depth) to **stderr** prefixed with `[extenderd]`.
+Run it from `start-extender.sh` rather than the TUI when you want those logs in
+your terminal. Re-run with different `--width/--fps/--bitrate/--codec/--gop`
+(see flags above) to A/B latency and quality.
+
+### Android app
+
+Full details — including **wireless `adb` debugging (no cable)** — are in
+[`docs/ANDROID.md`](docs/ANDROID.md) §7. The essentials (need *USB debugging* on):
+
+```bash
+cd android
+JAVA_HOME=/opt/android-studio/jbr ./gradlew installDebug          # build + install
+adb shell am start -n com.archextender/.MainActivity --ez autoconnect true
+adb logcat --pid=$(adb shell pidof com.archextender)              # app logs only
+```
+
+- **Wireless:** Android 11+ → Settings → Developer options → *Wireless debugging*
+  → *Pair device with pairing code*, then `adb pair <ip>:<pair-port>` and
+  `adb connect <ip>:<connect-port>`. Everything above then works over Wi-Fi.
+- This device **blocks `adb` input injection** — drive the app with the
+  `--ez autoconnect true` intent above instead of scripting taps.
+- Wireless `adb` only carries dev commands; the **video stream** still connects
+  to the PC's LAN IP directly (no `adb reverse` on the WiFi path).
+
 ## Project layout
 
 ```

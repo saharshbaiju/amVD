@@ -125,6 +125,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
 
     override fun onStreamInfo(width: Int, height: Int) = runOnUiThread {
         streamInfo = "$width × $height"
+        // Re-shape the surface to the real stream aspect ratio so a resolution
+        // change actually takes effect on screen (and tablets stop stretching).
+        b.surface.setAspectRatio(width, height)
         if (wantConnected) setState(State.CONNECTED)
     }
 

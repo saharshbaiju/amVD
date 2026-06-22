@@ -244,23 +244,106 @@ Surface (SurfaceView)  ──▶  display compositor  ──▶  your eyes
 
 ## 6. Running it
 
-```bash
-# build (uses Android Studio's bundled JDK 21)
-cd android
-JAVA_HOME=/opt/android-studio/jbr ./gradlew :app:assembleDebug
+In the app: enter host (the PC tether IP `192.168.42.x` for USB tethering, or the
+PC's LAN IP for WiFi) and port `5000`, then **Connect**. The overlay disappears
+and your `EXT-1` desktop appears. Tap the screen to bring the overlay back to
+disconnect.
 
-# install + launch
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n com.archextender/.MainActivity
-```
-
-In the app: enter host (`127.0.0.1` for USB, or the PC's LAN IP for WiFi) and
-port `5000`, then **Connect**. The overlay disappears and your `EXT-1` desktop
-appears. Tap the screen to bring the overlay back to disconnect.
+> **Plain end users need neither `adb` nor developer mode.** They install the APK
+> and use USB tethering (see the README). `adb` below is only for *developing /
+> debugging* the app.
 
 ---
 
-## 7. Current limitations (base) & next steps
+## 7. Developer install & debugging
+
+This section is for iterating on the app itself — installing debug builds,
+reading logs, and driving it from the command line. It needs **USB debugging**
+(Settings → Developer options → USB debugging) — which the end-user path does not.
+
+### 7.1 Build + install over USB
+
+```bash
+cd android
+
+# one-step build-and-install onto the connected device
+JAVA_HOME=/opt/android-studio/jbr ./gradlew installDebug
+
+# …or build the APK and push it yourself
+JAVA_HOME=/opt/android-studio/jbr ./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+> The CLI build needs **JDK 17–21**. The system JDK here is 26 (too new for this
+> Gradle 8.11 / AGP 8.9), so always point `JAVA_HOME` at Android Studio's bundled
+> JBR (JDK 21). Opening `android/` in Android Studio and pressing **Run** uses
+> that JBR automatically and skips all of this.
+
+### 7.2 Launch + drive from the command line
+
+```bash
+# plain launch
+adb shell am start -n com.archextender/.MainActivity
+
+# launch AND connect immediately (uses the host/port last saved in the app)
+adb shell am start -n com.archextender/.MainActivity --ez autoconnect true
+```
+
+The only recognised intent extra is `autoconnect` (boolean). Host and port are
+**not** settable by intent — the app reads them from its own EditText fields and
+persists them in `SharedPreferences`, so set them once in the UI and
+`autoconnect` reuses the saved pair on later launches.
+
+> **This device blocks `adb` input injection** (`input tap` / `input keyevent` →
+> `SecurityException`). You cannot script taps — use the `--ez autoconnect true`
+> intent above to reach the connected state instead of tapping **Connect**.
+
+### 7.3 Logs
+
+```bash
+adb logcat --pid=$(adb shell pidof com.archextender)   # only this app's logs
+adb logcat *:E                                          # all errors, system-wide
+adb logcat -c                                           # clear the buffer first
+```
+
+### 7.4 Wireless debugging (no cable)
+
+Run everything above over Wi-Fi — install, `am start`, `logcat` all work
+identically once the device is connected wirelessly. The phone and PC must be on
+the **same network**.
+
+**Android 11+ — pairing (no USB ever needed):**
+
+On the phone: Settings → Developer options → **Wireless debugging** → on →
+**Pair device with pairing code**. Then on the PC:
+
+```bash
+adb pair <phone-ip>:<pair-port>          # type the 6-digit code shown on the phone
+adb connect <phone-ip>:<connect-port>    # IP:port from the *main* Wireless-debugging
+                                         # screen — a DIFFERENT port than pairing
+adb devices -l                           # confirm it shows as "device"
+```
+
+**Android 10 or older — bootstrap over USB once:**
+
+```bash
+adb -d tcpip 5555                  # with the phone plugged in
+# unplug USB
+adb connect <phone-ip>:5555
+```
+
+Then build/install/launch/log exactly as in 7.1–7.3 — `adb` no longer cares that
+the transport is Wi-Fi.
+
+> **Wireless `adb` ≠ the wireless video path.** `adb` debugging over Wi-Fi only
+> ferries dev commands. The *stream* still connects straight to the PC's LAN IP on
+> port 5000 (the WiFi transport) — there is no `adb reverse`/tunnel involved on the
+> WiFi path. Wireless `adb` also drops when the phone sleeps or roams; just re-run
+> `adb connect`.
+
+---
+
+## 8. Current limitations (base) & next steps
 
 - **TCP only.** Great over USB; on lossy WiFi a dropped packet can briefly freeze
   the picture (head-of-line blocking). Planned: RTP/UDP + FEC for WiFi.
