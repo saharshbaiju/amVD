@@ -259,10 +259,13 @@ VA_DIRS = ("/usr/lib/dri", "/usr/lib64/dri", "/usr/lib/x86_64-linux-gnu/dri",
 def va_driver_for(node):
     """LIBVA_DRIVER_NAME that can *encode* on this render node, or None."""
     name = VA_DRIVERS.get(gpu_driver(node) or "")
-    if name == "iHD" and not any(os.path.exists(f"{d}/iHD_drv_video.so")
-                                 for d in VA_DIRS):
+    if name == "iHD" and not va_installed("iHD") and va_installed("i965"):
         name = "i965"                     # pre-Broadwell Intel / old distros
     return name
+
+
+def va_installed(name):
+    return any(os.path.exists(f"{d}/{name}_drv_video.so") for d in VA_DIRS)
 
 
 def encoder_candidates(requested, device):
@@ -378,9 +381,10 @@ class HyprlandBackend:
     def start_capture(self):
         """Launch wf-recorder; returns the readable Annex-B byte stream.
 
-        Tries each encoder candidate in turn: one that can't initialise exits
-        within a moment (wrong GPU, missing driver/NVENC), so we move on to
-        the next instead of leaving the phone with a black screen.
+        Tries each encoder candidate in turn: one that can't initialise either
+        exits within a moment (wrong GPU, missing driver/NVENC) or hangs without
+        output (some Intel VA-API drivers), so we move on to the next instead of
+        leaving the phone with a black screen.
         """
         a = self.a
         req = (a.encoder if a.encoder.startswith(("h264_", "hevc_", "libx26"))
@@ -391,8 +395,9 @@ class HyprlandBackend:
                 encoder = encoder.replace("h264_", "hevc_").replace("264", "265")
             log(f"encoder: {desc}")
             self._spawn(encoder, device, env)
-            if i == len(cands) - 1 or not self._dies_early():
+            if i == len(cands) - 1 or not self._fails_to_start():
                 return self.proc.stdout
+            self.stop_capture()
             log(f"encoder {encoder} failed to start; trying the next one")
         return self.proc.stdout
 
@@ -419,8 +424,13 @@ class HyprlandBackend:
         threading.Thread(target=self._wf_log, args=(self.proc,),
                          daemon=True).start()
 
-    def _dies_early(self, grace=2.5):
-        """True if wf-recorder exits before producing any output."""
+    def _fails_to_start(self, grace=4.0):
+        """True if wf-recorder exits, or produces nothing, within `grace` s.
+
+        A working encoder emits its first access unit in ~0.1 s; one still
+        silent after seconds is stuck (seen with VA-API on Intel) and would
+        leave the phone on a black screen.
+        """
         p = self.proc
         end = time.time() + grace
         while time.time() < end:
@@ -430,7 +440,8 @@ class HyprlandBackend:
             if r:      # bytes waiting (or EOF): alive a moment later = works
                 time.sleep(0.2)
                 return p.poll() is not None
-        return p.poll() is not None
+        log(f"no output after {grace:g}s")
+        return True
 
     def _wf_log(self, proc):
         """Forward wf-recorder's diagnostics (it explains why capture died)."""

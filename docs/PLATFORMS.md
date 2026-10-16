@@ -18,7 +18,10 @@ distro and backend and installs it (`i`) with pacman / apt / dnf.
 ## Arch Linux + Hyprland
 
 ```bash
-sudo pacman -S --needed hyprland wf-recorder libva-mesa-driver python   # NVIDIA: nvidia-utils provides NVENC
+sudo pacman -S --needed hyprland wf-recorder python
+# hardware encoding, by the GPU Hyprland renders on (x264 on the CPU otherwise):
+sudo pacman -S --needed intel-media-driver   # Intel (Broadwell+); libva-intel-driver for older
+sudo pacman -S --needed libva-mesa-driver    # AMD;  NVIDIA: nvidia-utils provides NVENC
 sudo pacman -S --needed libva-utils android-tools   # optional: VA-API probe, phone size via adb
 ```
 
@@ -29,7 +32,9 @@ sudo pacman -S --needed libva-utils android-tools   # optional: VA-API probe, ph
   driver; NVIDIA's VA-API driver can't encode), otherwise **VA-API** on that
   GPU's render node with the matching `LIBVA_DRIVER_NAME`. Force one with
   `--encoder h264_nvenc|h264_vaapi|libx264`. If the hardware encoder can't
-  start, the daemon falls back to x264 on the CPU automatically.
+  start (exits, or produces nothing for 4 s), the daemon falls back to x264
+  on the CPU automatically. The TUI's Dependencies screen lists the VA-API
+  driver your GPU needs (`intel-media-driver` / `libva-mesa-driver`) as optional.
 - Scales are snapped to the nearest value Hyprland accepts for the resolution
   (whole logical pixels), e.g. 1.5 → 1.333 at 2772×1280.
 - Workspaces 1–10 stay on the laptop, 11–20 live on the phone: move a window to
@@ -139,5 +144,6 @@ includes that address.
 | Hyprland: resolution/scale ignored | Hyprland ≥ 0.55 needs `hyprctl eval`; the daemon uses it automatically — check `hyprctl eval 'return 1'` prints `ok` |
 | Hyprland: `Unsupported format: bgra` / `Cannot create hw frames context` | Encoder on a different GPU than Hyprland; with `--encoder auto` it follows the compositor — check the daemon's `encoder:` log line |
 | Hyprland: *"invalid scale"* or *"EXT-1 overlaps"* popup | Fixed: scale is snapped to a valid value; if you still see it, two daemons were running — the new one now waits for the old one to exit |
+| Hyprland on Intel: connects, black screen | Install `intel-media-driver` (`vainfo` should list `VAProfileH264… VAEntrypointEncSlice*`); without it the daemon now falls back to x264 after 4 s — the log shows `encoder: …` lines for each attempt |
 | Stutter on Wi-Fi | Use 5 GHz, lower *Quality*, or use USB tethering |
 | Fedora: `openh264` download fails | Cisco mirror hiccup — retry, or use RPM Fusion's x264 (`gstreamer1-plugins-ugly`) |

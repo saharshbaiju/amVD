@@ -176,6 +176,29 @@ def _gst(element):
                         and gnome_backend.gst_inspect(element))
 
 
+def _va_encode_driver():
+    """(VA driver name, {distro: package}) Hyprland would encode with, or None.
+
+    Only for Intel/AMD compositor GPUs; NVIDIA uses NVENC from its driver.
+    """
+    card = hypr_backend.compositor_card()
+    node = hypr_backend.render_node(card) if card else None
+    va = hypr_backend.va_driver_for(node) if node else None
+    pkgs = {"iHD": {"arch": "intel-media-driver",
+                    "debian": "intel-media-va-driver",
+                    "fedora": "libva-intel-media-driver"},
+            "i965": {"arch": "libva-intel-driver", "debian": "i965-va-driver",
+                     "fedora": "libva-intel-driver"},
+            "radeonsi": {"arch": "libva-mesa-driver",
+                         "debian": "mesa-va-drivers",
+                         "fedora": "mesa-va-drivers"}}.get(va)
+    return (va, pkgs) if pkgs else None
+
+
+def _va_driver_present(name):
+    return lambda: hypr_backend.va_installed(name)
+
+
 def _any_h264_encoder():
     return bool(shutil.which("gst-inspect-1.0") and gnome_backend.pick_encoder())
 
@@ -191,7 +214,9 @@ DEPS = {
         ("vainfo", _bin("vainfo"),
          {"arch": "libva-utils", "debian": "vainfo", "fedora": "libva-utils"},
          False, "VA-API capability detection"),
-    ],
+    ] + ([("VA-API driver", _va_driver_present(_VA[0]), _VA[1], False,
+           "hardware H.264 encode on Intel/AMD (else x264 on the CPU)")]
+         if (_VA := _va_encode_driver()) else []),
     "gnome": [
         ("gst-launch-1.0", _bin("gst-launch-1.0"),
          {"arch": "gstreamer", "debian": "gstreamer1.0-tools",

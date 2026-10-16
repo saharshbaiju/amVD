@@ -87,9 +87,12 @@ therefore decides at start-up:
 | `amdgpu` / `i915` / `xe` | `h264_vaapi` on that GPU's render node | `LIBVA_DRIVER_NAME` forced to `radeonsi` / `iHD` (`i965` when iHD isn't installed) |
 | anything, if the above fails to start | `libx264` on the CPU (`preset=ultrafast tune=zerolatency`, `-x yuv420p`) | NVIDIA without NVENC, nouveau, VMs, VA drivers without H.264 encode |
 
-Each candidate gets 2.5 s: an encoder that can't initialise makes wf-recorder
-exit immediately, and the backend moves on to the next one instead of leaving
-the phone on a black screen (`encoder X failed to start; trying the next one`).
+Each candidate gets 4 s to produce its first byte (a working encoder needs
+~0.1 s). An encoder that can't initialise either makes wf-recorder exit, or
+leaves it alive but silent (seen with VA-API on Intel); either way the backend
+kills it and moves on instead of leaving the phone on a black screen
+(`encoder X failed to start; trying the next one`). The last candidate (x264)
+is never killed.
 
 Forcing `LIBVA_DRIVER_NAME` matters: NVIDIA Hyprland setups typically export
 `LIBVA_DRIVER_NAME=nvidia` globally, which makes `vainfo` (and FFmpeg) load the
