@@ -522,12 +522,41 @@ def lan_ip():
         return None
 
 
+# Kernel drivers of a phone's USB-tethering network gadget (Android RNDIS/NCM/
+# ECM, iPhone).
+TETHER_DRIVERS = ("rndis_host", "cdc_ncm", "cdc_ether", "cdc_eem", "ipheth")
+
+
+def usb_tether_links():
+    """[(ifname, ipv4 or None), ...] for phones tethering over USB right now.
+
+    Matched by kernel driver, so it works whatever the interface is called
+    (usb0, enp0s20f0u2, enx…) and whatever subnet the phone picked.
+    """
+    addrs = {}
+    for name, ip in _ip_addrs():
+        addrs.setdefault(name, ip)
+    links = []
+    for path in sorted(glob.glob("/sys/class/net/*")):
+        name = os.path.basename(path)
+        try:
+            drv = os.path.basename(os.readlink(f"{path}/device/driver"))
+        except OSError:
+            continue
+        if drv in TETHER_DRIVERS:
+            links.append((name, addrs.get(name)))
+    return links
+
+
 def usb_tether_ip():
     """This PC's IPv4 on the USB-tether link, or None if no phone is tethered.
 
-    Prefers Android's default 192.168.42.0/24 subnet; failing that (vendor with
-    a non-standard subnet) a USB-gadget-looking interface (usb0, enp0s20f0u1…).
+    By driver first (see usb_tether_links); failing that Android's classic
+    192.168.42.0/24 subnet or a USB-gadget-looking interface name.
     """
+    for _name, ip in usb_tether_links():
+        if ip:
+            return ip
     addrs = _ip_addrs()
     for _name, ip in addrs:
         if ip.startswith(USB_TETHER_PREFIX):
@@ -536,6 +565,54 @@ def usb_tether_ip():
         if name.startswith(("usb", "rndis", "ncm")) or re.search(r"u\d", name):
             return ip
     return None
+
+
+TETHER_NETWORK = "/etc/systemd/network/90-amvd-usb-tether.network"
+
+
+def tether_fix(ifname):
+    """argv that gets `ifname` (a USB-tether link with no address) an IP from
+    the phone's DHCP server, or None if we don't know how on this system.
+
+    GNOME/KDE run NetworkManager, which does this by itself; minimal setups
+    (Hyprland with iwd or systemd-networkd only) leave the link unconfigured.
+    """
+    if shutil.which("nmcli") and _active("NetworkManager"):
+        return ["nmcli", "device", "connect", ifname]
+    if _active("systemd-networkd") and shutil.which("networkctl"):
+        # Persistent: every future tether link gets DHCP too.
+        unit = ("[Match]\nDriver=" + " ".join(TETHER_DRIVERS) +
+                "\n\n[Network]\nDHCP=ipv4\n")
+        return ["sudo", "sh", "-c",
+                f"printf '{unit}' > {TETHER_NETWORK} && networkctl reload "
+                f"&& networkctl reconfigure {ifname}"]
+    for tool, args in (("dhcpcd", ["-1"]), ("dhclient", ["-1"]),
+                       ("udhcpc", ["-n", "-q", "-i"])):
+        if shutil.which(tool):
+            return ["sudo", "sh", "-c", f"ip link set {ifname} up && "
+                    + " ".join([tool] + args + [ifname])]
+    return None
+
+
+def usb_state(port: int):
+    """(summary, level, fix argv or None) for the wired paths, level being
+    'ok' / 'action' / 'hint'. Either path works on its own: USB tethering
+    (no developer options) or USB debugging (adb reverse)."""
+    if adb_reverse(port):
+        return "ready via USB debugging (127.0.0.1)", "ok", None
+    links = usb_tether_links()
+    ip = next((ip for _n, ip in links if ip), None) or usb_tether_ip()
+    if ip:
+        return f"USB tethering ready ({ip})", "ok", None
+    if links:
+        name = links[0][0]
+        fix = tether_fix(name)
+        return (("tethering on but no IP yet — press u", "action", fix)
+                if fix else (f"tethering on but {name} has no IP (no DHCP "
+                             "client)", "action", None))
+    if adb_status() == "unauthorized":
+        return "tap 'Allow USB debugging' on the phone", "action", None
+    return "turn on USB tethering (or USB debugging)", "hint", None
 
 
 def candidate_ips(cfg: Config) -> list:
