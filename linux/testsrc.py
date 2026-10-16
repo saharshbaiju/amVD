@@ -9,6 +9,8 @@ reaches this PC at 10.0.2.2) without touching your desktop layout.
 
     python3 testsrc.py [--width 2400 --height 1080 --fps 60 --port 5000]
     python3 testsrc.py --static      # one frame then silence: tests GOP replay
+    python3 testsrc.py --log-touch   # print the phone's touches (pairing key
+                                     # from ~/.config/archscreenextender)
 
 Needs gst-launch-1.0 with x264enc or openh264enc (see backends/gnome.py).
 """
@@ -23,8 +25,29 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import core  # noqa: E402
 import extenderd  # noqa: E402
 from backends import gnome  # noqa: E402
+from phone_input import PhoneInput  # noqa: E402
+
+
+class LoggingTouchscreen:
+    """Stands in for a real touchscreen: prints each touch it receives."""
+
+    slot_count = 10
+    description = "touches are printed, not injected"
+
+    def down(self, slot, x, y):
+        extenderd.log(f"touch down  slot {slot}  x={x:.3f} y={y:.3f}")
+
+    def move(self, slot, x, y):
+        extenderd.log(f"touch move  slot {slot}  x={x:.3f} y={y:.3f}")
+
+    def up(self, slot):
+        extenderd.log(f"touch up    slot {slot}")
+
+    def close(self):
+        pass
 
 
 def main():
@@ -37,6 +60,8 @@ def main():
                     help="videotestsrc pattern (smpte, ball, bar, …)")
     ap.add_argument("--static", action="store_true",
                     help="send 2 seconds of video, then keep the stream idle")
+    ap.add_argument("--log-touch", action="store_true",
+                    help="accept touches from paired phones and print them")
     args = ap.parse_args()
 
     enc = gnome.pick_encoder()
@@ -67,7 +92,11 @@ def main():
         "fps": args.fps, "scale": 1.0, "quality": "test", "bitrate": "8M",
         "codec": "h264", "gop": 30, "host": socket.gethostname(),
         "backend": "testsrc"}).encode()
-    b = extenderd.Broadcaster(banner)
+    phone_input = None
+    if args.log_touch:
+        phone_input = PhoneInput(core.pairing_key(), LoggingTouchscreen())
+        extenderd.log(f"pairing QR: {core.connect_uri(core.load_config())}")
+    b = extenderd.Broadcaster(banner, phone_input)
     stop = threading.Event()
     threading.Thread(target=extenderd.accept_loop,
                      args=("0.0.0.0", args.port, b, stop), daemon=True).start()

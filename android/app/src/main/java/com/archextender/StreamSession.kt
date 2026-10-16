@@ -11,6 +11,8 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -48,10 +50,18 @@ data class ServerConfig(
  *   * Decoder input buffers are sized for the real stream, not a 1080p guess,
  *     so big keyframes at native phone resolution aren't silently dropped.
  *   * A new SPS (resolution change) reconfigures the decoder.
+ *
+ * Touch input travels the other way on the same socket: right after
+ * connecting we send HELO with the pairing key from the QR code; the computer
+ * answers INPT saying whether this phone may send touches, and [sendTouch]
+ * then queues TUCH frames. Writes happen on a dedicated sender thread, so the
+ * UI thread never touches the network.
  */
 class StreamSession(
     private val hosts: List<String>,
     private val port: Int,
+    private val pairingKey: String,
+    private val appVersion: String,
     private val surface: Surface,
     private val listener: Listener,
 ) : Runnable {
@@ -61,6 +71,8 @@ class StreamSession(
         fun onFirstFrame(session: StreamSession)
         fun onStreamInfo(session: StreamSession, width: Int, height: Int)
         fun onServerConfig(session: StreamSession, config: ServerConfig)
+        /** The computer's answer to our HELO: may we send touches, and if not, why. */
+        fun onInputState(session: StreamSession, touchAllowed: Boolean, reason: String)
         fun onStopped(session: StreamSession, reason: String?)
     }
 
@@ -76,6 +88,11 @@ class StreamSession(
     private val info = MediaCodec.BufferInfo()
     private val au = java.io.ByteArrayOutputStream(1 shl 18)   // current access unit
 
+    /** Phone -> computer frames; set once connected. */
+    @Volatile private var writer: FrameWriter? = null
+    /** Serialises writes off the UI thread, in the order they were queued. */
+    private val sender = Executors.newSingleThreadExecutor { r -> Thread(r, "stream-sender") }
+
     /** The host that answered (one of [hosts]). */
     @Volatile var connectedHost: String? = null
         private set
@@ -85,6 +102,35 @@ class StreamSession(
     fun stop() {
         running = false
         try { socket?.close() } catch (_: Exception) {}
+    }
+
+    /**
+     * Queue one touch event. [x] and [y] are fractions (0..1) of the video
+     * picture; [finger] is Android's pointer id. Silently dropped before the
+     * connection is up or after it ended.
+     */
+    fun sendTouch(action: Int, finger: Int, x: Float, y: Float) {
+        val body = ByteArray(6)
+        val scaledX = (x.coerceIn(0f, 1f) * COORD_SCALE).toInt()
+        val scaledY = (y.coerceIn(0f, 1f) * COORD_SCALE).toInt()
+        body[0] = action.toByte()
+        body[1] = finger.coerceIn(0, 255).toByte()
+        body[2] = (scaledX ushr 8).toByte(); body[3] = scaledX.toByte()
+        body[4] = (scaledY ushr 8).toByte(); body[5] = scaledY.toByte()
+        sendInBackground(FrameWriter.TYPE_TOUCH, body)
+    }
+
+    private fun sendInBackground(type: String, body: ByteArray) {
+        val w = writer ?: return
+        try {
+            sender.execute {
+                try { w.send(type, body) } catch (_: IOException) {
+                    // the reader notices a dead connection and ends the session
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // session already released
+        }
     }
 
     /** Stop and wait for the decoder to be released (call before the Surface dies). */
@@ -100,6 +146,11 @@ class StreamSession(
             socket = s
             if (!running) return
             s.soTimeout = READ_TIMEOUT_MS
+            writer = FrameWriter(s.getOutputStream())
+            sendInBackground(FrameWriter.TYPE_HELLO, JSONObject()
+                .put("key", pairingKey)
+                .put("app", appVersion)
+                .toString().toByteArray(Charsets.UTF_8))
             listener.onConnected(this, connectedHost ?: "")
 
             val reader = FrameReader(s.getInputStream().buffered(1 shl 16))
@@ -111,6 +162,7 @@ class StreamSession(
                         serverConfig = it
                         listener.onServerConfig(this, it)
                     }
+                    FrameReader.TYPE_INPUT_STATE -> parseInputState(f.body)
                     FrameReader.TYPE_PING -> {}   // keepalive: resets the read timeout
                     // unknown frame types are ignored for forward compatibility
                 }
@@ -196,6 +248,16 @@ class StreamSession(
     } catch (e: Exception) {
         Log.w(TAG, "bad config frame", e)
         null
+    }
+
+    /** Parse an INPT frame body: {"touch": bool, "reason": "..."}. */
+    private fun parseInputState(body: ByteArray) {
+        try {
+            val o = JSONObject(String(body, Charsets.UTF_8))
+            listener.onInputState(this, o.optBoolean("touch", false), o.optString("reason", ""))
+        } catch (e: Exception) {
+            Log.w(TAG, "bad input-state frame", e)
+        }
     }
 
     /** NAL type = header byte & 0x1F, located right after the start code. */
@@ -320,6 +382,8 @@ class StreamSession(
 
     private fun release() {
         releaseCodec()
+        sender.shutdownNow()
+        writer = null
         try { socket?.close() } catch (_: Exception) {}
     }
 
@@ -330,5 +394,12 @@ class StreamSession(
         const val NAL_PPS = 8
         private const val CONNECT_TIMEOUT_MS = 3000
         private const val READ_TIMEOUT_MS = 4000
+
+        // TUCH actions (mirrored in linux/phone_input.py)
+        const val TOUCH_DOWN = 0
+        const val TOUCH_MOVE = 1
+        const val TOUCH_UP = 2
+        const val TOUCH_CANCEL = 3
+        private const val COORD_SCALE = 65535f
     }
 }

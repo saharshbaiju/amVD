@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -23,11 +24,15 @@ from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
 import backends
+import phone_input
+import uinput_touch
 from backends import gnome as gnome_backend
 from backends import hyprland as hypr_backend
 
 CONFIG_DIR = os.path.expanduser("~/.config/archscreenextender")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+# Shared secret that lets a phone send touches; travels only inside the QR.
+PAIRING_KEY_PATH = os.path.join(CONFIG_DIR, "pairing-key")
 
 # Quality preset -> CBR bitrate handed to the encoder.
 QUALITY = {"low": "4M", "medium": "8M", "high": "12M", "ultra": "20M"}
@@ -61,6 +66,7 @@ class Config:
     transport: str = "usb"         # usb / wifi (preferred address in the QR)
     port: int = 5000
     va_device: str = "/dev/dri/renderD128"
+    touch: bool = True             # let paired phones control the monitor
 
     def bitrate(self) -> str:
         return QUALITY.get(self.quality, "12M")
@@ -84,7 +90,8 @@ class Config:
             "--device", self.va_device,
             "--port", str(self.port),
             "--quality", self.quality,
-        ]
+            "--pairing-key-file", PAIRING_KEY_PATH,
+        ] + ([] if self.touch else ["--no-touch"])
 
 
 # --------------------------------------------------------------------------- #
@@ -632,8 +639,59 @@ def connect_uri(cfg: Config) -> str:
     """What the pairing QR encodes. The app tries every host in parallel and
     keeps the first that answers, so USB and Wi-Fi both just work:
 
-        asext://c?h=192.168.42.129,10.0.0.5&p=5000&n=archbox&v=1
+        asext://c?h=192.168.42.129,10.0.0.5&p=5000&n=archbox&k=<key>&v=1
+
+    `k` is the pairing key (only with touch on): a phone that scanned the QR
+    proves it by sending the key, and only then may it send touches.
     """
     hosts = ",".join(candidate_ips(cfg)) or "0.0.0.0"
     name = quote(socket.gethostname()[:24], safe="")
-    return f"asext://c?h={hosts}&p={cfg.port}&n={name}&v=1"
+    key = f"&k={pairing_key()}" if cfg.touch else ""
+    return f"asext://c?h={hosts}&p={cfg.port}&n={name}{key}&v=1"
+
+
+# --------------------------------------------------------------------------- #
+# Touch input
+# --------------------------------------------------------------------------- #
+
+def pairing_key() -> str:
+    """This computer's pairing key, created on first use (mode 0600)."""
+    return phone_input.ensure_pairing_key(PAIRING_KEY_PATH)
+
+
+def reset_pairing_key() -> str:
+    """Forget every paired phone: they must scan the new QR to touch again."""
+    try:
+        os.remove(PAIRING_KEY_PATH)
+    except FileNotFoundError:
+        pass
+    return pairing_key()
+
+
+UINPUT_RULE_PATH = "/etc/udev/rules.d/70-amvd-uinput.rules"
+UINPUT_MODULE_PATH = "/etc/modules-load.d/amvd-uinput.conf"
+# uaccess: logind grants the user at the seat (you, not other accounts or
+# remote logins) access to /dev/uinput. Numbered before 73-seat-late.rules,
+# which is where the tag takes effect.
+UINPUT_RULE = ('KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", '
+               'OPTIONS+="static_node=uinput"')
+
+
+def touch_setup_check(cfg: Config):
+    """What stops touch input from working on this computer, or None.
+
+    Returns {"problem": text, "fix": argv (run with sudo) or None}. Only the
+    Hyprland backend needs setup (a uinput device); GNOME injects touches
+    through Mutter's RemoteDesktop API without any permissions.
+    """
+    if not cfg.touch or cfg.resolved_backend() != "hyprland":
+        return None
+    problem = uinput_touch.uinput_access_problem()
+    if not problem:
+        return None
+    script = (f"echo {shlex.quote(UINPUT_RULE)} > {UINPUT_RULE_PATH} && "
+              f"echo uinput > {UINPUT_MODULE_PATH} && modprobe uinput && "
+              "udevadm control --reload && "
+              "udevadm trigger --name-match=/dev/uinput && "
+              "udevadm settle")
+    return {"problem": problem, "fix": ["sudo", "sh", "-c", script]}

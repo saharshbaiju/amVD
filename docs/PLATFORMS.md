@@ -39,6 +39,25 @@ sudo pacman -S --needed libva-utils android-tools   # optional: VA-API probe, ph
   (whole logical pixels), e.g. 1.5 → 1.333 at 2772×1280.
 - Workspaces 1–10 stay on the laptop, 11–20 live on the phone: move a window to
   workspace 11+ with your usual keybinds, or just drag it across the edge.
+- **Touch input** needs a one-time setup: the phone's touches are replayed
+  through a virtual touchscreen in `/dev/uinput`, which is root-only on a stock
+  Arch install. The installer offers to add a udev rule that gives it to the
+  user logged in at the seat; or start the extender in `amvd` and press **t**
+  when the live view says *Touch: needs one-time setup*. What it runs (with
+  sudo):
+
+  ```bash
+  echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' \
+      > /etc/udev/rules.d/70-amvd-uinput.rules
+  echo uinput > /etc/modules-load.d/amvd-uinput.conf
+  modprobe uinput && udevadm control --reload \
+      && udevadm trigger --name-match=/dev/uinput && udevadm settle
+  ```
+
+  (If you're already in the `input` group and `/dev/uinput` is group-writable —
+  ydotool's package does this — nothing is needed.) The device is called
+  `amvd-touch` (`hyprctl devices` lists it under *touch* while streaming) and is
+  mapped onto `EXT-1` with `hl.device({ name = "amvd-touch", output = "EXT-1" })`.
 
 ## Ubuntu (22.04 and newer, GNOME)
 
@@ -91,10 +110,24 @@ sudo dnf install android-tools             # optional
 5. H.264 from the encoder goes through `h264parse` (SPS/PPS before every
    keyframe) into a pipe; from there it's the same daemon as on Hyprland.
 
+**Touch input** needs no setup on GNOME. Before step 1 the daemon creates a
+session on Mutter's RemoteDesktop D-Bus API and links the ScreenCast session to
+it (`remote-desktop-session-id`); in step 2 the pair is started through the
+RemoteDesktop session. Touches are then injected with
+`NotifyTouchDown/Motion/Up` on the virtual monitor's stream, in its pixel
+coordinates. Mutter creates its virtual touchscreen on the first touch, so the
+seat only advertises touch from then on (the first tap itself is delivered).
+If the RemoteDesktop session can't be created, video still works and the phone
+shows why touch is off.
+
 **Tested:** Ubuntu 24.04 (Mutter 46, headless, in Docker): the virtual monitor
 appears as `Meta-1`, is placed on the configured side, and H.264 (x264enc)
-reaches the client and decodes. Fedora shares the same code path (only package
-names differ); a full Fedora run is still pending.
+reaches the client and decodes. Fedora 42 (Mutter 48) passes the same run with
+openh264. Touch (2026-10-16): on both, a paired client's taps and drags reach a
+Wayland window on the virtual monitor (`wev` shows `wl_touch` down/motion/up at
+the expected positions), two fingers get separate ids, a finger left down when
+the client disconnects is lifted, and a client with the wrong key injects
+nothing.
 
 When the daemon exits for any reason, its D-Bus connection closes and Mutter
 removes the monitor and moves its windows back — nothing to clean up.
@@ -146,4 +179,9 @@ includes that address.
 | Hyprland: *"invalid scale"* or *"EXT-1 overlaps"* popup | Fixed: scale is snapped to a valid value; if you still see it, two daemons were running — the new one now waits for the old one to exit |
 | Hyprland on Intel: connects, black screen | Install `intel-media-driver` (`vainfo` should list `VAProfileH264… VAEntrypointEncSlice*`); without it the daemon now falls back to x264 after 4 s — the log shows `encoder: …` lines for each attempt |
 | Stutter on Wi-Fi | Use 5 GHz, lower *Quality*, or use USB tethering |
+| Phone sheet: *Touch Off — Scan the QR code…* | The phone connected with a typed address or a QR from before touch existed: scan the current QR |
+| Phone sheet: *Touch Off — pairing key changed* | *Paired phones → forget all* was used (or the key file deleted): scan the current QR |
+| Hyprland: *Touch: needs one-time setup* | `/dev/uinput` isn't writable — press **t** in the live view (see *Arch Linux + Hyprland*); after a kernel update without the modules-load file, `sudo modprobe uinput` |
+| Hyprland: touches land on the laptop screen | The device mapping was dropped (e.g. a Hyprland config reload) — change side/scale or restart the stream to re-apply it; check `hyprctl devices` shows `amvd-touch` |
+| Touch does nothing in one app | That app doesn't handle Wayland touch events (some terminals and older toolkits); GTK, Qt, Chromium/Electron and Firefox do |
 | Fedora: `openh264` download fails | Cisco mirror hiccup — retry, or use RPM Fusion's x264 (`gstreamer1-plugins-ugly`) |

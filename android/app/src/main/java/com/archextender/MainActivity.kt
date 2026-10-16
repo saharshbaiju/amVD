@@ -39,6 +39,10 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
  *              into the video. Chrome is just a fading status pill and a slim
  *              edge handle that opens a side sheet (details + Disconnect).
  *  RECONNECTING  the link dropped after working; retries with backoff.
+ *
+ * Touch: while LIVE, and once the computer has accepted our pairing key, every
+ * touch on the video goes to the computer (see [TouchForwarder]). Without
+ * touch, a tap on the video just peeks the status pill.
  */
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.Listener {
 
@@ -62,6 +66,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
 
     private var streamSize = ""
     private var serverConfig: ServerConfig? = null
+    private var touchAllowed = false       // the computer accepted our pairing key
+    private var touchRefusedReason = ""    // why not, shown in the side sheet
+    private val touchForwarder = TouchForwarder { action, finger, x, y ->
+        session?.sendTouch(action, finger, x, y)
+    }
     private var linkHost = ""
     private var wifiLock: WifiManager.WifiLock? = null
 
@@ -98,6 +107,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
         b.surface.setOnClickListener {
             if (sheetOpen) closeSheet() else if (state != State.IDLE) peekChrome()
         }
+        b.surface.setOnTouchListener { view, event -> forwardTouch(view, event) }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 // An edge swipe in immersive mode is easy to trigger by
@@ -155,11 +165,23 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
         return super.dispatchTouchEvent(ev)
     }
 
+    /**
+     * Live with touch allowed: the touch belongs to the desktop, so send it to
+     * the computer and consume it. Otherwise return false so a tap falls
+     * through to the click listener.
+     */
+    @SuppressLint("ClickableViewAccessibility")   // taps act on the remote desktop
+    private fun forwardTouch(view: View, event: MotionEvent): Boolean {
+        if (state != State.LIVE || !touchAllowed || sheetOpen) return false
+        touchForwarder.forward(view, event)
+        return true
+    }
+
     // ------------------------------------------------------------ connect card
 
     private fun onPrimary() {
         if (b.manualGroup.visibility == View.VISIBLE) {
-            val t = ConnectTarget.manual(b.hostInput.text.toString(), b.portInput.text.toString())
+            val t = ConnectTarget.manual(b.hostInput.text.toString(), b.portInput.text.toString(), target)
             if (t == null) {
                 showError("Enter the computer's IP address, e.g. 192.168.42.129")
                 return
@@ -261,7 +283,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
     private fun launchSession() {
         val t = target ?: return
         if (!surfaceReady || !wantConnected || session != null) return
-        session = StreamSession(t.hosts, t.port, b.surface.holder.surface, this)
+        setTouchState(false, "")       // until the new session's INPT arrives
+        session = StreamSession(t.hosts, t.port, t.pairingKey, appVersion(),
+            b.surface.holder.surface, this)
     }
 
     private fun userDisconnect(why: String) {
@@ -341,9 +365,22 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
         fillSheet()
     }
 
+    override fun onInputState(session: StreamSession, touchAllowed: Boolean, reason: String) =
+        runOnUiThread {
+            if (session !== this.session) return@runOnUiThread
+            setTouchState(touchAllowed, reason)
+        }
+
+    private fun setTouchState(allowed: Boolean, refusedReason: String) {
+        touchAllowed = allowed
+        touchRefusedReason = refusedReason
+        fillSheet()
+    }
+
     override fun onStopped(session: StreamSession, reason: String?) = runOnUiThread {
         if (session !== this.session) return@runOnUiThread
         this.session = null
+        setTouchState(false, "")
         if (!wantConnected) return@runOnUiThread
         if (!everStreamed) {
             failConnect(friendlyError(reason))
@@ -483,6 +520,18 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
             it.quality.replaceFirstChar(Char::uppercase) +
                 if (it.bitrate.isNotEmpty()) " · ${it.bitrate}bps" else ""
         } ?: "—"
+        b.sheetTouch.text = when {
+            touchAllowed -> getString(R.string.touch_on)
+            state == State.LIVE && session != null -> getString(R.string.touch_off)
+            else -> "—"
+        }
+        val touchNote = when {
+            touchAllowed -> getString(R.string.touch_on_hint)
+            target?.pairingKey.isNullOrEmpty() -> getString(R.string.touch_needs_qr)
+            else -> touchRefusedReason
+        }
+        b.sheetTouchNote.text = touchNote
+        b.sheetTouchNote.visibility = if (touchNote.isEmpty() || state == State.IDLE) View.GONE else View.VISIBLE
         b.sheetBackend.text = when (sc?.backend) {
             "hyprland" -> "Hyprland"
             "gnome" -> "GNOME"
@@ -500,6 +549,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
     // ------------------------------------------------------------------ misc
 
     private fun dp(v: Float) = v * resources.displayMetrics.density
+
+    private fun appVersion(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+    } catch (_: Exception) {
+        ""
+    }
 
     private fun centerOf(v: View): Pair<Float, Float> {
         val loc = IntArray(2); v.getLocationInWindow(loc)

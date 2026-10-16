@@ -6,6 +6,10 @@ Pipeline:
         -> wf-recorder (wlr-screencopy + VA-API H.264, zero-copy on the iGPU)
         -> raw Annex-B H.264 on a pipe -> extenderd's parser
 
+Touch input: a uinput touchscreen ("amvd-touch", see uinput_touch.py) that
+Hyprland maps onto EXT-1 with `hl.device({ name, output })`, so touches land on
+the phone's monitor and the mouse cursor stays where it is.
+
 Hyprland 0.55 replaced hyprlang with a Lua config parser, so `hyprctl keyword`
 and `hyprctl dispatch` silently fail there. Everything that changes monitors or
 workspaces goes through `hyprctl eval '<lua>'` first and only falls back to the
@@ -22,6 +26,8 @@ import subprocess
 import sys
 import threading
 import time
+
+import uinput_touch
 
 # Workspace split: the laptop keeps LAPTOP_WS, the phone hosts EXT_WS, so the
 # secondary monitor behaves as a true extension. Bound as rules *before* the
@@ -176,6 +182,16 @@ def apply_live(name, width, height, fps, scale, side):
     ok = set_monitor(name, mode, est, scale)
     set_monitor(name, mode, flush_position(name, side, est), scale)
     return ok
+
+
+def map_touch_device(device, output):
+    """Confine an absolute touch device to one monitor (instead of the whole
+    desktop layout). Re-applied on live changes: a config reload drops it."""
+    r = hyprctl("eval", f'hl.device({{ name = "{device}", output = "{output}" }})')
+    out = (r.stdout or "").lower()
+    if r.returncode == 0 and "ok" in out and "error" not in out:
+        return True
+    return hyprctl("keyword", f"device[{device}]:output", output).returncode == 0
 
 
 def remove_output(name):
@@ -451,8 +467,22 @@ class HyprlandBackend:
             if line:
                 log("wf: " + line)
 
+    def create_touch_surface(self):
+        """A uinput touchscreen whose whole area is the phone's monitor."""
+        problem = uinput_touch.uinput_access_problem()
+        if problem:
+            raise RuntimeError(f"{problem}; run amvd on the computer and "
+                               "press t to set up touch")
+        screen = uinput_touch.VirtualTouchscreen(self.a.width, self.a.height)
+        if not map_touch_device(uinput_touch.DEVICE_NAME, self.a.output):
+            log("warning: could not map the touch device to "
+                f"{self.a.output}; touches may land on the wrong monitor")
+        screen.description += f" mapped to {self.a.output}"
+        return screen
+
     def apply_live(self, side, scale):
         a = self.a
+        map_touch_device(uinput_touch.DEVICE_NAME, a.output)
         ok = apply_live(a.output, a.width, a.height, a.fps, scale, side)
         log(f"moved {a.output} side={side} scale={scale}")
         return ok

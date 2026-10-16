@@ -24,6 +24,11 @@ Reliability rules (each one fixed a real "connects then drops" bug):
     frame of a burst isn't held hostage until the next frame arrives.
 
 Transport is plain TCP on 0.0.0.0 (USB tethering, Wi-Fi, adb reverse all work).
+
+Touch input flows the other way on the same connection: each client also has a
+reader thread that hands the phone's frames (pairing hello, touches) to
+phone_input.PhoneInput, which replays touches on the backend's virtual
+touchscreen. See phone_input.py.
 """
 
 import argparse
@@ -40,6 +45,8 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backends  # noqa: E402
+from phone_input import (MAX_INCOMING_FRAME, PhoneInput,  # noqa: E402
+                         load_pairing_key)
 
 # H.264 NAL unit types (nal_unit_header & 0x1F)
 NAL_NON_IDR = 1
@@ -96,7 +103,9 @@ def kill_stale():
 #   NALU -> one Annex-B NAL (with start code), straight to the decoder
 #   ASX1 -> JSON of the active settings, shown on the phone (any time)
 #   PING -> empty keepalive, sent after HEARTBEAT seconds of silence
-# Unknown types are ignored by the phone, so new ones stay compatible.
+#   INPT -> JSON answer to the phone's HELO: is touch allowed? (phone_input.py)
+# Phone -> PC frames (HELO, TUCH) are handled in phone_input.py.
+# Unknown types are ignored on both ends, so new ones stay compatible.
 
 FRAME_NAL = b"NALU"
 FRAME_BANNER = b"ASX1"
@@ -157,9 +166,10 @@ MAX_GOP_CACHE = 16 * 1024 * 1024   # stop caching a GOP that grows past this
 
 
 class Client:
-    """One phone: a queue of whole frames drained by a dedicated thread."""
+    """One phone: a queue of whole frames drained by a dedicated sender thread,
+    and a reader thread for what the phone sends back (hello, touches)."""
 
-    def __init__(self, sock, addr, on_dead):
+    def __init__(self, sock, addr, on_dead, on_message=None):
         self.sock = sock
         self.addr = addr
         self.started = False        # True once it has a keyframe to decode from
@@ -168,8 +178,15 @@ class Client:
         self._qbytes = 0
         self._cv = threading.Condition()
         self._on_dead = on_dead
+        self._on_message = on_message
         threading.Thread(target=self._run, daemon=True,
                          name=f"client-{addr[0]}").start()
+        threading.Thread(target=self._read_loop, daemon=True,
+                         name=f"client-{addr[0]}-reader").start()
+
+    def send_message(self, frame_type, body=b""):
+        """Queue a control frame (not video) for this phone."""
+        self.push(frame(frame_type, body))
 
     def push(self, data):
         with self._cv:
@@ -223,6 +240,47 @@ class Client:
                 pass
             self._on_dead(self)
 
+    def _read_loop(self):
+        """Read frames the phone sends and hand them to `on_message`.
+
+        Runs until the socket closes. Socket timeouts only mean "the phone had
+        nothing to say" (the timeout is set for the sender's benefit).
+        """
+        try:
+            while self.alive:
+                header = self._recv_exact(8)
+                if header is None:
+                    break
+                frame_type = header[:4]
+                length = int.from_bytes(header[4:], "big")
+                if length > MAX_INCOMING_FRAME:
+                    log(f"client {self.addr[0]} sent an oversized frame; "
+                        "disconnecting it")
+                    break
+                body = self._recv_exact(length) if length else b""
+                if body is None:
+                    break
+                if self._on_message:
+                    self._on_message(self, frame_type, body)
+        except OSError:
+            pass
+        self.close()
+
+    def _recv_exact(self, length):
+        """Exactly `length` bytes, or None when the connection ends."""
+        data = bytearray()
+        while len(data) < length:
+            try:
+                chunk = self.sock.recv(length - len(data))
+            except socket.timeout:
+                if not self.alive:
+                    return None
+                continue
+            if not chunk:
+                return None
+            data += chunk
+        return bytes(data)
+
 
 def _tune_socket(sock):
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -239,8 +297,9 @@ def _tune_socket(sock):
 class Broadcaster:
     """Fans NAL frames out to every client; owns the SPS/PPS/GOP caches."""
 
-    def __init__(self, banner_payload=b""):
+    def __init__(self, banner_payload=b"", phone_input=None):
         self._clients = []
+        self.phone_input = phone_input      # handles HELO / TUCH, or None
         self._lock = threading.Lock()
         self.sps = None             # framed
         self.pps = None             # framed
@@ -258,7 +317,8 @@ class Broadcaster:
     def add(self, sock, addr):
         _tune_socket(sock)
         with self._lock:
-            c = Client(sock, addr, self._remove)
+            c = Client(sock, addr, self._remove,
+                       self.phone_input.on_message if self.phone_input else None)
             c.push(frame(FRAME_BANNER, self.banner_payload))
             if self.gop:
                 # Replay the current GOP: the decoder catches up to "now"
@@ -276,6 +336,8 @@ class Broadcaster:
             if c in self._clients:
                 self._clients.remove(c)
             n = len(self._clients)
+        if self.phone_input:
+            self.phone_input.on_disconnect(c)   # lift fingers it left down
         log(f"client disconnected: {c.addr[0]}:{c.addr[1]} (total {n})")
 
     def close_all(self):
@@ -427,6 +489,30 @@ def accept_loop(host, port, broadcaster, stop_evt):
 
 
 # --------------------------------------------------------------------------- #
+# Touch input
+# --------------------------------------------------------------------------- #
+
+def start_touch(args, backend):
+    """Create the backend's virtual touchscreen.
+
+    Returns (surface, "") on success, or (None, reason) — the reason is shown
+    on the phone, so it is phrased for the user.
+    """
+    if not args.touch:
+        return None, "touch input is turned off on the computer"
+    if not load_pairing_key(args.pairing_key_file):
+        log("touch input: off (no pairing key; start from the amvd TUI)")
+        return None, "the computer has no pairing key"
+    try:
+        surface = backend.create_touch_surface()
+    except Exception as e:
+        log(f"touch input: unavailable ({e})")
+        return None, str(e)
+    log(f"touch input: ready ({surface.description})")
+    return surface, ""
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 
@@ -466,6 +552,11 @@ def main():
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--keep-output", action="store_true",
                     help="don't remove the Hyprland headless output on exit")
+    ap.add_argument("--pairing-key-file", default=None,
+                    help="file holding the pairing key; only phones that send "
+                         "it (from the QR code) may use touch input")
+    ap.add_argument("--no-touch", dest="touch", action="store_false",
+                    help="don't accept touch input from phones")
     args = ap.parse_args()
 
     backend = backends.create(args.backend, args)
@@ -482,7 +573,6 @@ def main():
         log(f"error: could not create the virtual monitor ({e})")
         sys.exit(1)
 
-    broadcaster = Broadcaster(load_banner_payload(args, backend.name))
     stop_evt = threading.Event()
     reload_evt = threading.Event()
 
@@ -492,6 +582,13 @@ def main():
         log(f"error: could not start capture ({e})")
         backend.teardown()
         sys.exit(1)
+
+    touch_surface, touch_problem = start_touch(args, backend)
+    phone_input = PhoneInput(load_pairing_key(args.pairing_key_file),
+                             touch_surface=touch_surface,
+                             unavailable_reason=touch_problem)
+    broadcaster = Broadcaster(load_banner_payload(args, backend.name),
+                              phone_input)
 
     threading.Thread(target=accept_loop,
                      args=(args.host, args.port, broadcaster, stop_evt),
@@ -534,6 +631,8 @@ def main():
     finally:
         shutdown()
         broadcaster.close_all()
+        if touch_surface:
+            touch_surface.close()
         # A GNOME virtual monitor dies with our session anyway; only Hyprland's
         # headless output can outlive the daemon (the TUI uses that on restart).
         if not args.keep_output or backend.name == "gnome":

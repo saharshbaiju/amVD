@@ -436,6 +436,22 @@
                             <TextView style="@style/StatLabel" android:text="@string/stat_desktop" />
                             <TextView android:id="@+id/sheetBackend" style="@style/StatValue" />
                         </LinearLayout>
+
+                        <!-- full width: the "why not" note can be a sentence -->
+                        <LinearLayout
+                            style="@style/StatTile"
+                            android:layout_columnSpan="2">
+                            <TextView style="@style/StatLabel" android:text="@string/stat_touch" />
+                            <TextView android:id="@+id/sheetTouch" style="@style/StatValue" />
+                            <TextView
+                                android:id="@+id/sheetTouchNote"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="2dp"
+                                android:textAppearance="?attr/textAppearanceBodySmall"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:visibility="gone" />
+                        </LinearLayout>
                     </GridLayout>
                 </LinearLayout>
             </androidx.core.widget.NestedScrollView>

@@ -8,8 +8,9 @@ import java.io.InputStream
  *     4-byte type + 4-byte big-endian length + body
  *
  * Type "NALU" carries one Annex-B NAL (with start code); "ASX1" carries the
- * Linux-side settings as JSON. Framing (rather than scanning Annex-B start
- * codes) lets the daemon interleave config updates with video at any time.
+ * Linux-side settings as JSON; "INPT" says whether touch input is allowed.
+ * Framing (rather than scanning Annex-B start codes) lets the daemon
+ * interleave config updates with video at any time.
  */
 class FrameReader(private val src: InputStream) {
 
@@ -46,6 +47,7 @@ class FrameReader(private val src: InputStream) {
         const val TYPE_NAL = "NALU"
         const val TYPE_CONFIG = "ASX1"
         const val TYPE_PING = "PING"   // keepalive, empty body
+        const val TYPE_INPUT_STATE = "INPT"   // answer to HELO: touch allowed?
         private const val MAX_FRAME = 32 * 1024 * 1024   // sanity cap
     }
 }

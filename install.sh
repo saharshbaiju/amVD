@@ -21,6 +21,10 @@ warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
 if [[ "${1:-}" == "--uninstall" ]]; then
   rm -rf "$DEST" "$BIN/amvd" "$APPS/amvd.desktop"
   say "Removed Screen Extender (settings kept in ~/.config/archscreenextender)."
+  if [[ -e /etc/udev/rules.d/70-amvd-uinput.rules ]]; then
+    say "Touch-input access rule left in place; remove it with:"
+    say "  sudo rm /etc/udev/rules.d/70-amvd-uinput.rules /etc/modules-load.d/amvd-uinput.conf"
+  fi
   exit 0
 fi
 
@@ -110,7 +114,32 @@ sys.exit(subprocess.run(f["fix"]).returncode if f else 0)'; then
   fi
 fi
 
-# ---- 5. make `amvd` callable from any new terminal
+# ---- 5. touch input (Hyprland only): the phone's touches are replayed through a
+#         virtual touchscreen in /dev/uinput, which is root-only on most distros.
+#         A udev rule grants it to whoever is logged in at the seat (uaccess).
+#         GNOME needs nothing: Mutter's RemoteDesktop API injects the touches.
+TOUCH_FIX="$(python3 -c '
+import core, shlex
+t = core.touch_setup_check(core.Config())
+print(shlex.join(t["fix"]) if t and t["fix"] else "")')"
+if [[ -n "$TOUCH_FIX" ]]; then
+  warn "Touch input needs access to /dev/uinput (one-time setup, asks for sudo):"
+  warn "  $TOUCH_FIX"
+  if [[ -r /dev/tty ]]; then
+    read -r -p "Set it up now? [Y/n] " ans </dev/tty || ans=n
+    if [[ ! "$ans" =~ ^[Nn] ]]; then
+      if python3 -c 'import core, subprocess, sys
+t = core.touch_setup_check(core.Config())
+sys.exit(subprocess.run(t["fix"]).returncode if t else 0)'; then
+        say "Touch input ready"
+      else
+        warn "Couldn't set up touch input; run 'amvd', start the extender and press t"
+      fi
+    fi
+  fi
+fi
+
+# ---- 6. make `amvd` callable from any new terminal
 on_path=1; case ":$PATH:" in *":$BIN:"*) ;; *) on_path=0;; esac
 if (( ! on_path )); then
   line='export PATH="$HOME/.local/bin:$PATH"   # added by amvd installer'

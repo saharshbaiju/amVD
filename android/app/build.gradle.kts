@@ -11,8 +11,8 @@ android {
         applicationId = "com.archextender"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.4.0"
     }
 
     // Release signing. The keystore lives OUTSIDE the repo; point at it with
@@ -35,6 +35,13 @@ android {
     }
 
     buildTypes {
+        // Debug builds get their own package id and name, so they install next
+        // to the release app (different signing keys can't replace each other)
+        // and a test build never removes the working one.
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = false
             signingConfig = if (releaseKeystore != null) signingConfigs.getByName("release")

@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | PC side (Python, no build step) | `install.sh` from the `main` branch; downloads the latest release's `amvd-linux.tar.gz` (falls back to the `main` tarball if there's no release yet) | `curl -fsSL https://raw.githubusercontent.com/saharshbaiju/amVD/main/install.sh \| bash`, then `amvd` |
 | Phone app | GitHub Releases: `amVD-<version>.apk`, signed with the amVD release key | Download on the phone, install |
+| Debug app (testers) | GitHub Releases: `amVD-<version>-debug.apk` — package `com.archextender.debug`, named *Screen Extender (debug)* | Installs *next to* the normal app; for logs and testing |
 
 The installer is distro-agnostic: it asks `linux/core.py` which packages are
 missing for *this* distro and desktop (the same list as the TUI's Dependencies
@@ -32,8 +33,11 @@ user has to uninstall before the next version installs. Never commit them.
 Without these properties `assembleRelease` falls back to the debug key, which is
 fine for local testing but must not be published.
 
-A phone that has a *debug* build (Android Studio / `assembleDebug`) must
-uninstall it once before installing a release APK (different signature).
+Debug builds use their own package id (`applicationIdSuffix ".debug"`) and the
+name *Screen Extender (debug)*, so a debug build and the release app install side
+by side and never replace each other. Only an *old* build of
+`com.archextender` signed with a different key (e.g. 0.2, built before the
+release key existed) must be uninstalled once before the first release APK.
 
 ## Cutting a release
 
@@ -41,19 +45,21 @@ uninstall it once before installing a release APK (different signature).
 2. Build and package:
 
    ```bash
-   V=0.3.0
-   (cd android && JAVA_HOME=/opt/android-studio/jbr ./gradlew assembleRelease)
+   V=0.4.0
+   (cd android && JAVA_HOME=/opt/android-studio/jbr ./gradlew assembleRelease assembleDebug)
    mkdir -p dist
    cp android/app/build/outputs/apk/release/app-release.apk dist/amVD-$V.apk
+   cp android/app/build/outputs/apk/debug/app-debug.apk dist/amVD-$V-debug.apk
    tar --exclude=__pycache__ -czf dist/amvd-linux.tar.gz linux
-   (cd dist && sha256sum amVD-$V.apk amvd-linux.tar.gz > SHA256SUMS)
+   (cd dist && sha256sum amVD-$V.apk amVD-$V-debug.apk amvd-linux.tar.gz > SHA256SUMS)
    ```
 
 3. Commit, tag and publish:
 
    ```bash
    git tag -a v$V -m "amVD $V" && git push origin main v$V
-   gh release create v$V dist/amVD-$V.apk dist/amvd-linux.tar.gz dist/SHA256SUMS \
+   gh release create v$V dist/amVD-$V.apk dist/amVD-$V-debug.apk \
+       dist/amvd-linux.tar.gz dist/SHA256SUMS \
        --title "amVD $V" --notes-file <notes>
    ```
 

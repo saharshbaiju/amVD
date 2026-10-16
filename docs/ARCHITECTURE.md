@@ -21,9 +21,11 @@ have to be physical. So:
    where possible).
 3. **Ship** it to the phone over USB tethering or Wi-Fi.
 4. **Decode and display** with **no buffering**.
+5. **Send touches back** and replay them on the virtual monitor through a
+   virtual *touchscreen*, so the phone is a touch monitor (§4, Stage 5).
 
-The phone is a *thin client*: it just decodes video. All the "monitor-ness"
-lives on the Linux side, in a **backend** per compositor:
+The phone is a *thin client*: it decodes video and reports touches. All the
+"monitor-ness" lives on the Linux side, in a **backend** per compositor:
 
 ```
  ┌──────────────── Linux ─────────────────────────────┐        ┌── Android ──┐
@@ -38,6 +40,9 @@ lives on the Linux side, in a **backend** per compositor:
  │                       │ pipe                        │        │             │
  │             extenderd.py  (parse, GOP cache,        │  TCP   │ MediaCodec  │
  │             per-client senders, heartbeats) ────────┼───────▶│  → Surface  │
+ │             phone_input.py (pairing, touches) ◀─────┼────────┤ touches     │
+ │               → uinput touchscreen  (Hyprland)      │        │             │
+ │               → Mutter RemoteDesktop (GNOME)        │        │             │
  │                       ▲                             │        │             │
  │             tui.py (config, QR pairing, lifecycle)  │        │             │
  └─────────────────────────────────────────────────────┘        └─────────────┘
@@ -254,15 +259,22 @@ waited for damage that might never come — a black screen.
 
 ### Stage 3 — Transport (framed TCP)
 
-Every message is **`4-byte type` + `4-byte big-endian length` + body**:
+Every message, in both directions, is **`4-byte type` + `4-byte big-endian
+length` + body**:
 
-| Type | Body | When |
-| --- | --- | --- |
-| `NALU` | one Annex-B NAL, start code included → straight to the decoder | video |
-| `ASX1` | JSON settings: `side width height fps scale quality bitrate codec gop host backend` | on connect, and on any live config change |
-| `PING` | empty | after 1 s with nothing else to send |
+| Type | Direction | Body | When |
+| --- | --- | --- | --- |
+| `NALU` | PC → phone | one Annex-B NAL, start code included → straight to the decoder | video |
+| `ASX1` | PC → phone | JSON settings: `side width height fps scale quality bitrate codec gop host backend` | on connect, and on any live config change |
+| `PING` | PC → phone | empty | after 1 s with nothing else to send |
+| `HELO` | phone → PC | JSON `{"key": "<pairing key>", "app": "0.4.0"}` | once, right after connecting |
+| `INPT` | PC → phone | JSON `{"touch": true\|false, "reason": "<why not>"}` | the answer to `HELO` |
+| `TUCH` | phone → PC | 6 bytes: `action u8, finger u8, x u16, y u16` (big-endian) | every touch change (Stage 5) |
 
-Unknown types are ignored by the phone, so new types stay compatible.
+Unknown types are ignored on both ends, so new types stay compatible (an old
+phone never sends `HELO` and simply gets no touch; an old daemon ignores
+`HELO`/`TUCH` and never answers `INPT`). The daemon refuses phone → PC frames
+larger than 4 KB.
 
 **Per-client sender threads.** Each phone has a queue of *whole frames* drained
 by its own thread with blocking `sendall` (5 s timeout). The parser only ever
@@ -283,12 +295,13 @@ detected on both ends within seconds instead of hanging half-open.
 - **Wi-Fi**: the phone connects to the PC's LAN address.
 - `adb reverse tcp:5000 tcp:5000` also works (phone connects to `127.0.0.1`).
 
-**Pairing QR.** The TUI encodes `asext://c?h=<ip1>,<ip2>&p=5000&n=<hostname>&v=1`
-with every plausible address (USB tether first or LAN first, per *Preferred
+**Pairing QR.** The TUI encodes
+`asext://c?h=<ip1>,<ip2>&p=5000&n=<hostname>&k=<pairing key>&v=1` with every
+plausible address (USB tether first or LAN first, per *Preferred
 link*; Docker/VPN/VM bridges excluded) and draws it with Unicode half-blocks
 (`qr.py`, dependency-free, verified with `zbarimg`). The app connects to *all*
 listed hosts in parallel and keeps the first that answers — so the same QR works
-over USB and Wi-Fi.
+over USB and Wi-Fi. `k` is the pairing key that unlocks touch input (Stage 5).
 
 > TCP's weakness: on lossy Wi-Fi a lost packet stalls everything behind it
 > (head-of-line blocking). The roadmap moves Wi-Fi to RTP/UDP + FEC.
@@ -297,6 +310,107 @@ over USB and Wi-Fi.
 
 The phone feeds whole access units to the hardware `MediaCodec` decoder and
 renders every frame on arrival. See [`ANDROID.md`](./ANDROID.md).
+
+### Stage 5 — Touch input (phone → PC)
+
+Touching the phone's screen acts on the virtual monitor, like a touchscreen
+monitor would — **without moving the computer's mouse pointer**. That is the
+key design decision: the phone's touches are injected as a virtual
+*touchscreen*, never as a mouse. A touchscreen delivers each touch straight to
+the window under the finger (Wayland `wl_touch`), so you can keep using the
+laptop's touchpad while someone taps on the phone.
+
+```
+phone: MotionEvent ─▶ TouchForwarder ─▶ TUCH (fraction of the video picture)
+   ─TCP─▶ client reader thread ─▶ PhoneInput (paired?) ─▶ TouchRouter (slots)
+   ─▶ backend touch surface ─▶ compositor ─▶ window under the finger
+```
+
+**Coordinates.** The phone sends positions as fractions of the *video picture*,
+scaled to 0..65535. Its video view is letterboxed to the stream's exact aspect
+ratio, so a fraction of the view is the same fraction of the virtual monitor —
+neither side needs the other's resolution, and the black bars never produce
+touches. Each backend turns fractions into its own coordinate space.
+
+**Fingers.** Android pointer ids travel as the `finger` byte. `TouchRouter`
+(`phone_input.py`) gives every *(phone, finger)* its own slot on the shared
+device (10 slots), so two phones touching at once never collide, and when a
+phone disconnects mid-gesture its fingers are lifted (no stuck touch).
+`action`: 0 down, 1 move, 2 up, 3 cancel (lift every finger of that phone).
+
+**Pairing (who may touch).** The daemon listens on every interface, so anyone
+on the same Wi-Fi can *connect*. Watching the screen is one thing; controlling
+the desktop is another, so touch needs a **pairing key**:
+
+1. The TUI creates a random key once (`~/.config/archscreenextender/pairing-key`,
+   mode 0600, 144 bits) and puts it in the QR (`k=`).
+2. The daemon reads it from that file (`--pairing-key-file`; never on the
+   command line, which other local users can read).
+3. A phone sends the key in `HELO`. The daemon compares it in constant time
+   (`hmac.compare_digest`) and answers `INPT`. Touches from a phone that hasn't
+   been accepted are dropped.
+4. **Configure → Paired phones → forget all** regenerates the key: every phone
+   must scan the new QR before it can touch again.
+
+Video stays open to any client (as before); only input is gated. The key
+travels unencrypted over the LAN, like the video — TLS is on the roadmap.
+
+**Hyprland: a uinput touchscreen** (`uinput_touch.py`). The daemon creates a
+kernel input device named `amvd-touch` through `/dev/uinput` (pure Python ioctls,
+no dependencies) speaking the multi-touch protocol *type B* that real
+touchscreens use (`ABS_MT_SLOT`, `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X/Y`,
+plus `BTN_TOUCH` and `ABS_X/Y`, which libinput requires), flagged
+`INPUT_PROP_DIRECT`. Its axes span the virtual monitor's pixels, and Hyprland is
+told to map it onto that monitor only:
+
+```
+hyprctl eval 'hl.device({ name = "amvd-touch", output = "EXT-1" })'
+```
+
+(legacy fallback: `hyprctl keyword device[amvd-touch]:output EXT-1`; re-applied on
+every live side/scale change because a config reload drops it). The device
+lives as long as the daemon: windows only see touch support while it exists.
+
+`/dev/uinput` is root-only on most distros, so this needs a one-time setup — a
+udev rule that grants it to the user logged in at the seat (`uaccess`, the same
+mechanism that gives you your sound card), plus loading the `uinput` module at
+boot:
+
+```
+/etc/udev/rules.d/70-amvd-uinput.rules
+  KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+/etc/modules-load.d/amvd-uinput.conf
+  uinput
+```
+
+The installer offers it; the TUI's live view shows *Touch: needs one-time setup —
+press t* when it's missing (`core.touch_setup_check`).
+
+**GNOME: Mutter RemoteDesktop** (`backends/gnome.py`). No root and no uinput:
+the backend creates an `org.gnome.Mutter.RemoteDesktop` session first, then
+links the ScreenCast session to it (`CreateSession({"remote-desktop-session-id":
+…})`) and starts the pair through the RemoteDesktop session. Touches go to
+`NotifyTouchDown/Motion(stream, slot, x, y)` / `NotifyTouchUp(slot)`, where
+`stream` is our virtual-monitor stream and `x, y` are in its pixel space. Mutter
+ties the session to the D-Bus connection that created it, so it lives exactly as
+long as the daemon. If the RemoteDesktop session can't be created, the backend
+falls back to a plain ScreenCast session: video works and phones are told why
+touch is unavailable.
+
+**What it can and can't do.** Taps, drags, scrolling, long-press menus and
+pinch-zoom work in apps that support touch on Wayland (GTK, Qt, Chromium/
+Electron, Firefox) — the apps interpret the gestures, exactly as with a real
+touchscreen. Tapping a window focuses it, so keyboard input follows your taps.
+There is no hover, and an app that ignores touch events ignores the phone too.
+
+**Verified** (2026-10-16): Hyprland 0.56.2 with the real daemon (taps land at the
+right logical position on `EXT-1`, two fingers get separate slots, the
+disconnect lifts a finger left down, the cursor doesn't move); GNOME in
+containers on Mutter 46.2 (Ubuntu 24.04) and 48.8 (Fedora 42), observed with
+`wev`; a wrong pairing key gets `touch: false` and injects nothing. On a real
+phone (Android, USB with adb reverse, Hyprland + NVENC at 2560×1440@120):
+taps, scrolling and pinch work smoothly; 138 recorded touches, every finger-down
+matched by a finger-up.
 
 ---
 
@@ -327,9 +441,10 @@ tui.py ──spawns──▶ extenderd.py --keep-output --banner-file …
                        │
                        ├─ backend.setup()          create the virtual monitor
                        ├─ backend.start_capture()  wf-recorder | gst-launch-1.0  → pipe
-                       ├─ accept thread            TCP :5000, one sender thread per phone
+                       ├─ start_touch()            virtual touchscreen (uinput / RemoteDesktop)
+                       ├─ accept thread            TCP :5000, per phone: a sender + a reader thread
                        ├─ control thread           SIGHUP → re-read banner → apply side/scale live
-                       └─ on exit                  stop capture, close clients,
+                       └─ on exit                  stop capture, close clients, remove the touch device,
                                                    remove monitor (unless --keep-output on Hyprland)
 ```
 
@@ -371,5 +486,7 @@ causes; each is fixed and documented next to the code:
 - **RTP/UDP + FEC** for lossy Wi-Fi (keep TCP for USB).
 - **HEVC** decode in the app (the Hyprland backend can already encode it).
 - **KDE Plasma** backend (KWin virtual outputs via `kwin_wayland` screencast).
-- **Touch / pen input** back to the PC (uinput / virtual-pointer).
+- **Pen input** (pressure, hover) and a keyboard from the phone.
+- **TLS** with the certificate fingerprint pinned in the QR (video and touch are
+  currently unencrypted on the LAN).
 - **Latency HUD** overlay for tuning.

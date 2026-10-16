@@ -23,6 +23,15 @@ daemon exits, Mutter removes it and moves its windows back automatically.
 Side and scale are applied through org.gnome.Mutter.DisplayConfig
 (ApplyMonitorsConfig, method "temporary" so nothing is written to
 monitors.xml and no "keep these settings?" dialog appears).
+
+Touch input uses Mutter's RemoteDesktop API (what GNOME Remote Desktop uses).
+A RemoteDesktop session is created first and the ScreenCast session is linked
+to it (`remote-desktop-session-id`); the linked pair is then started through
+the RemoteDesktop session. Touches are sent with NotifyTouchDown/Motion/Up
+against our virtual-monitor stream, so they land on the phone's monitor and the
+mouse pointer doesn't move. No root, no uinput. If the RemoteDesktop session
+can't be created, the backend falls back to a plain ScreenCast session (video
+works, touch is reported as unavailable).
 """
 
 import os
@@ -40,6 +49,10 @@ except Exception:              # reported via missing()
 SC_BUS = "org.gnome.Mutter.ScreenCast"
 SC_PATH = "/org/gnome/Mutter/ScreenCast"
 SC_IFACE = "org.gnome.Mutter.ScreenCast"
+RD_BUS = "org.gnome.Mutter.RemoteDesktop"
+RD_PATH = "/org/gnome/Mutter/RemoteDesktop"
+RD_IFACE = "org.gnome.Mutter.RemoteDesktop"
+RD_SESSION_IFACE = RD_IFACE + ".Session"
 DC_BUS = "org.gnome.Mutter.DisplayConfig"
 DC_PATH = "/org/gnome/Mutter/DisplayConfig"
 DC_IFACE = "org.gnome.Mutter.DisplayConfig"
@@ -228,6 +241,67 @@ def place_monitor(bus, connector, side, scale):
 
 
 # --------------------------------------------------------------------------- #
+# Touch input (Mutter RemoteDesktop)
+# --------------------------------------------------------------------------- #
+
+class MutterTouchscreen:
+    """Touches injected through a RemoteDesktop session onto our stream.
+
+    Mutter takes coordinates in the stream's own pixel space (the virtual
+    monitor's width x height), so fractions from the phone are scaled by the
+    monitor size we asked for.
+    """
+
+    slot_count = 10
+
+    def __init__(self, bus, rd_session, stream_path, width, height):
+        self.description = "Mutter RemoteDesktop touch on the virtual monitor"
+        self._bus = bus
+        self._session = rd_session
+        self._stream = stream_path
+        self._width = width
+        self._height = height
+        self._active_slots = set()
+        self._warned = False
+
+    def down(self, slot, x, y):
+        self._active_slots.add(slot)
+        self._notify("NotifyTouchDown", "(sudd)",
+                     (self._stream, slot, *self._to_pixels(x, y)))
+
+    def move(self, slot, x, y):
+        if slot in self._active_slots:
+            self._notify("NotifyTouchMotion", "(sudd)",
+                         (self._stream, slot, *self._to_pixels(x, y)))
+
+    def up(self, slot):
+        if slot in self._active_slots:
+            self._active_slots.discard(slot)
+            self._notify("NotifyTouchUp", "(u)", (slot,))
+
+    def release_all(self):
+        for slot in sorted(self._active_slots):
+            self.up(slot)
+
+    def close(self):
+        self.release_all()      # the session itself is stopped in teardown()
+
+    def _to_pixels(self, x, y):
+        x = min(max(x, 0.0), 1.0)
+        y = min(max(y, 0.0), 1.0)
+        return x * (self._width - 1), y * (self._height - 1)
+
+    def _notify(self, method, signature, values):
+        try:
+            _call(self._bus, RD_BUS, self._session, RD_SESSION_IFACE, method,
+                  GLib.Variant(signature, values), timeout=1000)
+        except Exception as e:
+            if not self._warned:          # once, not at 120 events/s
+                self._warned = True
+                log(f"warning: touch event rejected by Mutter ({e})")
+
+
+# --------------------------------------------------------------------------- #
 # backend
 # --------------------------------------------------------------------------- #
 
@@ -237,7 +311,10 @@ class GnomeBackend:
     def __init__(self, args):
         self.a = args
         self.bus = None
-        self.session = None
+        self.session = None             # ScreenCast session path
+        self.remote_desktop = None      # linked RemoteDesktop session, or None
+        self.touch_problem = ""         # why remote_desktop is None
+        self.stream = None              # ScreenCast stream path (touch target)
         self.node = None
         self.proc = None
         self.connector = None
@@ -258,16 +335,32 @@ class GnomeBackend:
         return miss
 
     def setup(self):
-        """Open a Mutter screencast session with a virtual-monitor stream."""
+        """Open a Mutter screencast session with a virtual-monitor stream.
+
+        With touch enabled, the screencast session is linked to a new
+        RemoteDesktop session, and the pair is started through the latter.
+        """
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self._before = connectors(self.bus)
+        if getattr(self.a, "touch", False):
+            self._open_remote_desktop()
+
+        session_options = {}
+        if self.remote_desktop:
+            session_id = _call(self.bus, RD_BUS, self.remote_desktop,
+                               "org.freedesktop.DBus.Properties", "Get",
+                               GLib.Variant("(ss)", (RD_SESSION_IFACE,
+                                                     "SessionId")))[0]
+            session_options["remote-desktop-session-id"] = GLib.Variant(
+                "s", session_id)
         (self.session,) = _call(self.bus, SC_BUS, SC_PATH, SC_IFACE,
                                 "CreateSession",
-                                GLib.Variant("(a{sv})", ({},)))
+                                GLib.Variant("(a{sv})", (session_options,)))
         props = {"cursor-mode": GLib.Variant("u", CURSOR_EMBEDDED),
                  "is-platform": GLib.Variant("b", True)}
-        (stream,) = _call(self.bus, SC_BUS, self.session, SC_IFACE + ".Session",
-                          "RecordVirtual", GLib.Variant("(a{sv})", (props,)))
+        (self.stream,) = _call(self.bus, SC_BUS, self.session,
+                               SC_IFACE + ".Session", "RecordVirtual",
+                               GLib.Variant("(a{sv})", (props,)))
 
         got = {}
 
@@ -275,9 +368,17 @@ class GnomeBackend:
             got["node"] = params.unpack()[0]
 
         sub = self.bus.signal_subscribe(SC_BUS, SC_IFACE + ".Stream",
-                                        "PipeWireStreamAdded", stream, None,
-                                        Gio.DBusSignalFlags.NONE, on_added)
-        _call(self.bus, SC_BUS, self.session, SC_IFACE + ".Session", "Start")
+                                        "PipeWireStreamAdded", self.stream,
+                                        None, Gio.DBusSignalFlags.NONE,
+                                        on_added)
+        if self.remote_desktop:
+            # A linked screencast session is started through its
+            # RemoteDesktop session (as gnome-remote-desktop does).
+            _call(self.bus, RD_BUS, self.remote_desktop, RD_SESSION_IFACE,
+                  "Start")
+        else:
+            _call(self.bus, SC_BUS, self.session, SC_IFACE + ".Session",
+                  "Start")
         ctx = GLib.MainContext.default()
         deadline = time.monotonic() + 10
         while "node" not in got and time.monotonic() < deadline:
@@ -288,6 +389,24 @@ class GnomeBackend:
             raise RuntimeError("Mutter never announced the PipeWire stream")
         self.node = got["node"]
         log(f"mutter virtual monitor stream on pipewire node {self.node}")
+
+    def _open_remote_desktop(self):
+        """Create the RemoteDesktop session touch input needs (best effort)."""
+        try:
+            (self.remote_desktop,) = _call(self.bus, RD_BUS, RD_PATH, RD_IFACE,
+                                           "CreateSession")
+        except Exception as e:
+            self.remote_desktop = None
+            self.touch_problem = ("GNOME refused a remote-desktop session "
+                                  f"({e})")
+            log(f"touch input: {self.touch_problem}; streaming without it")
+
+    def create_touch_surface(self):
+        if not self.remote_desktop:
+            raise RuntimeError(self.touch_problem
+                               or "touch input is turned off on the computer")
+        return MutterTouchscreen(self.bus, self.remote_desktop, self.stream,
+                                 self.a.width, self.a.height)
 
     def start_capture(self):
         a = self.a
@@ -351,12 +470,19 @@ class GnomeBackend:
                 p.kill()
 
     def teardown(self):
-        """Stop the session: Mutter removes the monitor and rehomes windows."""
+        """Stop the session: Mutter removes the monitor and rehomes windows.
+
+        A linked pair is stopped through the RemoteDesktop session.
+        """
         if self.bus and self.session:
             try:
-                _call(self.bus, SC_BUS, self.session, SC_IFACE + ".Session",
-                      "Stop")
+                if self.remote_desktop:
+                    _call(self.bus, RD_BUS, self.remote_desktop,
+                          RD_SESSION_IFACE, "Stop")
+                else:
+                    _call(self.bus, SC_BUS, self.session,
+                          SC_IFACE + ".Session", "Stop")
             except Exception:
                 pass
-            self.session = None
+            self.session = self.remote_desktop = None
             log("stopped mutter screencast session (virtual monitor removed)")

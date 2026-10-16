@@ -1,7 +1,8 @@
 # Screen Extender — Android App
 
 The phone is a thin client: it connects, decodes H.264 with the hardware decoder,
-and puts every frame on screen the moment it's ready. This document covers the
+puts every frame on screen the moment it's ready, and sends your touches back so
+the phone works as a touch monitor. This document covers the
 UI, the components, how a frame travels through the app, and how to develop and
 debug it. The Linux side is in [`ARCHITECTURE.md`](./ARCHITECTURE.md).
 
@@ -91,10 +92,19 @@ canvas-drawn rings and a clipped circular reveal.
 (*Live · 2400 × 1080*) that fades after ~3 s, and a slim handle on the right edge
 that opens a **side sheet** with the stream's details — computer name, link
 (USB tethering / Wi-Fi / adb) and address, resolution, refresh rate, scale,
-position, quality, desktop (Hyprland / GNOME) — and **Disconnect**. Tap the video
-to peek the pill; Back closes the sheet; while live it *opens* the sheet instead of
+position, quality, desktop (Hyprland / GNOME), **touch** (on / off and why) —
+and **Disconnect**. Back closes the sheet; while live it *opens* the sheet instead of
 disconnecting (an accidental edge swipe never drops the stream — Disconnect is a
 deliberate tap in the sheet). Back while connecting cancels.
+
+**Touch:** once the computer has accepted the phone's pairing key, every touch
+on the video goes to the computer (§4.6): tap, drag, scroll, long-press, pinch —
+handled by the desktop apps like a real touchscreen, while the computer's mouse
+pointer stays where it is. Touches on the black letterbox bars, the edge handle
+and the open sheet stay on the phone. Without touch (address typed by hand, an
+old QR, or touch off/unavailable on the computer) a tap on the video peeks the
+status pill instead, and the sheet's *Touch* row says why it's off — e.g. *"Scan
+the QR code on your computer to use touch."*
 
 **Errors are specific:** *"titan-arch is reachable, but the extender isn't
 running"* (connection refused) vs *"Couldn't reach titan-arch. Turn on USB
@@ -108,8 +118,11 @@ arrived"* (10 s watchdog).
 ```
 app/src/main/java/com/archextender/
   MainActivity.kt          UI state machine, scanner, transitions, side sheet, lifecycle
-  StreamSession.kt         connect (parallel, all hosts) → framed reader → MediaCodec
-  FrameReader.kt           the daemon's framed protocol: NALU / ASX1 / PING
+  StreamSession.kt         connect (parallel, all hosts) → framed reader → MediaCodec;
+                           HELO / INPT handshake and the touch sender thread
+  FrameReader.kt           the daemon's framed protocol: NALU / ASX1 / PING / INPT
+  FrameWriter.kt           phone → computer frames: HELO / TUCH
+  TouchForwarder.kt        MotionEvent → TUCH (fractions of the video picture)
   ConnectTarget.kt         asext:// QR / deep-link parsing, manual entry, persistence
   RippleRevealLayout.kt    water ripple + reveal (AGSL on 13+, canvas fallback)
   AspectRatioSurfaceView.kt  letterboxes the video to the stream's aspect ratio
@@ -150,9 +163,17 @@ Runs on its own thread:
    wins, the others are closed. A *refused* connection is reported in preference
    to a timeout (it means "computer reachable, extender not running").
 2. **Read frames** with a 4 s socket timeout (the daemon PINGs every second).
-3. `ASX1` → `ServerConfig` (shown in the side sheet; its width/height size the
+3. **Say hello**: send `HELO {"key": <pairing key>, "app": <version>}`.
+4. `ASX1` → `ServerConfig` (shown in the side sheet; its width/height size the
    decoder's input buffers). `PING` → nothing (it just resets the timeout).
-4. `NALU` → access-unit assembly → decoder.
+   `INPT {"touch": …, "reason": …}` → `onInputState` (touch on/off).
+5. `NALU` → access-unit assembly → decoder.
+
+**Writes never block the UI.** `sendTouch()` is called from the UI thread; it
+packs the 6-byte `TUCH` body and hands it to a single-thread executor
+(`stream-sender`) that writes through `FrameWriter`. One thread keeps frames in
+order and whole; a write error is ignored there because the reader notices the
+dead connection and ends the session.
 
 **Access units, not NALs.** Hardware decoders (e.g. Qualcomm C2) reject partial
 input; they need one complete frame per input buffer. NALs are accumulated and
@@ -174,14 +195,19 @@ padded 1088) so the letterbox is exact.
 ### 4.3 `FrameReader`
 
 `4-byte type + 4-byte big-endian length + body`, read fully; lengths over 32 MB
-are treated as a corrupt stream. Types: `NALU`, `ASX1`, `PING`; unknown types are
-skipped for forward compatibility.
+are treated as a corrupt stream. Types: `NALU`, `ASX1`, `PING`, `INPT`; unknown
+types are skipped for forward compatibility. `FrameWriter` is the mirror image
+for `HELO` and `TUCH`: each frame is assembled and written in one synchronized
+call, so two frames can never interleave on the socket.
 
 ### 4.4 `ConnectTarget`
 
-Parses `asext://c?h=<ip>[,<ip>…]&p=<port>&n=<name>&v=1`, validates hosts, and
-persists the last target in `SharedPreferences`. Manual entry accepts
-`host`, `host:port`, or a separate port field.
+Parses `asext://c?h=<ip>[,<ip>…]&p=<port>&n=<name>&k=<pairing key>&v=1`,
+validates hosts, and persists the last target (key included) in
+`SharedPreferences`. Manual entry accepts `host`, `host:port`, or a separate port
+field; it keeps the saved name and pairing key when the typed address is one the
+saved computer already advertised on the same port (you only corrected the
+address), and otherwise has no key — view only until you scan the QR.
 
 ### 4.5 `RippleRevealLayout`
 
@@ -190,6 +216,31 @@ uniforms (`origin, time, amp, reveal, edge, density`) and re-applies
 `RenderEffect.createRuntimeShaderEffect` every frame; transparent output pixels
 expose the video `SurfaceView` beneath. `startRipple(x, y)`, `reveal(onDone)`,
 `settle()` (waves calm down after a failure), `reset()`.
+
+### 4.6 Touch input (`TouchForwarder` + `MainActivity.forwardTouch`)
+
+The video `SurfaceView` has a touch listener. While the state is **LIVE**, the
+computer has answered `INPT touch: true`, and the side sheet is closed, it
+consumes every event and passes it to `TouchForwarder`; otherwise it returns
+`false`, so the normal click handling (peek the pill) runs.
+
+`TouchForwarder` maps `MotionEvent`s to `TUCH` frames:
+
+| MotionEvent | `TUCH` action | sent for |
+| --- | --- | --- |
+| `ACTION_DOWN`, `ACTION_POINTER_DOWN` | 0 down | the pointer at `actionIndex` |
+| `ACTION_MOVE` | 1 move | every pointer |
+| `ACTION_UP`, `ACTION_POINTER_UP` | 2 up | the pointer at `actionIndex` |
+| `ACTION_CANCEL` | 3 cancel | all fingers (the computer lifts them) |
+
+`finger` is the Android pointer id. `x`/`y` are the position divided by the
+view's size, scaled to 0..65535. Because `AspectRatioSurfaceView` sizes the view
+to the stream's exact aspect ratio, those fractions are fractions of the
+computer's virtual monitor; touches on the letterbox bars never reach the view.
+Gesture meaning (long-press, scroll, pinch) is left to the desktop apps.
+
+Touch state resets to *off* whenever a session starts or stops, and turns on
+only from the current session's `INPT`, so a stale answer can't enable it.
 
 ---
 
@@ -236,7 +287,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ### 7.2 Drive it from the command line
 
 ```bash
-# open with a computer pre-filled (exactly what scanning the QR does)
+# open with a computer pre-filled (exactly what scanning the QR does);
+# add &k=$(cat ~/.config/archscreenextender/pairing-key) to enable touch
 adb shell am start -a android.intent.action.VIEW -d "'asext://c?h=192.168.42.129&p=5000&n=archbox&v=1'"
 
 # launch and connect to the saved computer immediately
@@ -254,7 +306,12 @@ heartbeats, GOP replay) without creating a monitor:
 ```bash
 python3 linux/testsrc.py --width 2400 --height 1080 --fps 60   # port 5000
 python3 linux/testsrc.py --static     # 2 s of video, then silence: tests GOP replay
+python3 linux/testsrc.py --log-touch  # accept touches from paired phones, print them
 ```
+
+With `--log-touch`, every touch is printed as a fraction of the picture
+(`touch down  slot 0  x=0.500 y=0.500`), using this computer's pairing key; so
+the touch path can be tested with `adb shell input tap/swipe` on the emulator.
 
 The **Android emulator** reaches the PC at `10.0.2.2`, so
 `asext://c?h=10.0.2.2&p=5000` connects an emulator to it. A Google Play system
@@ -286,7 +343,9 @@ Wireless adb only carries dev commands; the video still goes straight to the PC.
 
 - **TCP only** — great over USB; lossy Wi-Fi can briefly freeze (head-of-line
   blocking). Planned: RTP/UDP + FEC.
-- **No input** — touch/pen events aren't sent back yet.
+- **Touch only** — no pen pressure/hover, no on-screen keyboard to type on the
+  computer yet; there is no hover, and desktop apps that ignore touch events
+  ignore the phone too.
 - **H.264 only** — HEVC would cut bitrate.
 - The QR scanner needs Google Play services; without them use the stock camera
   or manual entry.

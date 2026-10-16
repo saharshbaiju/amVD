@@ -39,4 +39,8 @@ if cfg.transport == "usb" and not core.usb_tether_ip():
 print()
 EOF
 
-exec python3 "${HERE}/extenderd.py" --port "${PORT}" "$@" </dev/null
+# The QR carries the pairing key (core.connect_uri creates it on first use); the
+# daemon reads the same file so phones that scanned the QR may use touch.
+KEY_FILE="$HOME/.config/archscreenextender/pairing-key"   # core.PAIRING_KEY_PATH
+exec python3 "${HERE}/extenderd.py" --port "${PORT}" \
+  --pairing-key-file "${KEY_FILE}" "$@" </dev/null

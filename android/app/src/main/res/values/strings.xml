@@ -21,4 +21,9 @@
     <string name="stat_position">Position</string>
     <string name="stat_quality">Quality</string>
     <string name="stat_desktop">Desktop</string>
+    <string name="stat_touch">Touch</string>
+    <string name="touch_on">On</string>
+    <string name="touch_off">Off</string>
+    <string name="touch_on_hint">Tap, drag, scroll and pinch on the screen. Your computer\'s mouse pointer stays put.</string>
+    <string name="touch_needs_qr">Scan the QR code on your computer to use touch.</string>
 </resources>

@@ -92,7 +92,7 @@ def run_shell(win, cmd, prompt="press Enter to return"):
 # needs the daemon restarted. side/scale are applied live by the daemon itself
 # (SIGHUP -> backend.apply_live); transport only changes the QR's host order.
 RESTART_KEYS = ("backend", "output", "width", "height", "fps", "quality",
-                "codec", "gop", "port")
+                "codec", "gop", "port", "touch")
 LIVE_KEYS = ("side", "scale")
 
 
@@ -110,6 +110,7 @@ class Stream:
         self.logs = deque(maxlen=8)
         self.state = {"live": 0, "ever": False}
         self.error = None
+        self.touch_status = ""          # daemon's "touch input: ..." verdict
         self.stop = threading.Event()
 
     def running(self):
@@ -121,6 +122,10 @@ class Stream:
         # tether link — nothing to set up here. The phone connects to this PC's
         # tether IP; the pairing QR lists every reachable address.
         core.write_banner_file(self.cfg)        # settings shown on the phone
+        if self.cfg.touch:
+            # The daemon reads the key once at start-up; create it now (on a
+            # fresh install the QR that would create it isn't drawn yet).
+            core.pairing_key()
         args = self.cfg.extenderd_args()
         self.error = None
         cmd = [sys.executable, DAEMON, "--keep-output",
@@ -142,6 +147,8 @@ class Stream:
                 self.state["ever"] = True
             elif "client disconnected" in line:
                 self.state["live"] = max(0, self.state["live"] - 1)
+            elif "touch input:" in line:
+                self.touch_status = line.split("touch input:", 1)[1].strip()
             elif "error:" in line:
                 self.error = line.split("error:", 1)[1].strip()
         self.stop.set()
@@ -169,6 +176,7 @@ class Stream:
         self.cfg = cfg
         self.logs.clear()
         self.state = {"live": 0, "ever": False}
+        self.touch_status = ""
         self.start()
 
     def disconnect(self):
@@ -409,6 +417,8 @@ def configure_screen(win, cfg, live=False):
         ("Keyframe interval", "choice", "gop", [15, 30, 60]),
         ("Preferred link", "choice", "transport", ["usb", "wifi"]),
         ("Port", "port", None, None),
+        ("Touch input", "choice", "touch", [True, False]),
+        ("Paired phones", "forget", None, None),
     ]
     res_idx = next((i for i, (_lbl, dims) in enumerate(core.RES_PRESETS)
                     if dims == (cfg.width, cfg.height)), 0)
@@ -427,6 +437,11 @@ def configure_screen(win, cfg, live=False):
             elif key == "backend":
                 value = (f"auto → {cfg.resolved_backend() or 'unsupported'}"
                          if cfg.backend == "auto" else cfg.backend)
+            elif key == "touch":
+                value = ("on   (phones that scanned the QR can tap)"
+                         if cfg.touch else "off  (view only)")
+            elif kind == "forget":
+                value = "Enter: forget all (they must rescan the QR)"
             elif key == "transport":
                 value = ("usb  (USB tethering first in the QR)"
                          if cfg.transport == "usb" else
@@ -469,6 +484,10 @@ def configure_screen(win, cfg, live=False):
                 raw = text_prompt(win, "Port", cfg.port)
                 if raw.isdigit():
                     cfg.port = int(raw)
+            elif kind == "forget" and c in (curses.KEY_ENTER, 10, 13):
+                answer = text_prompt(win, "Forget all paired phones? (y/N)", "")
+                if answer.strip().lower() == "y":
+                    core.reset_pairing_key()
         elif c == ord("s"):
             core.save_config(cfg)
             return True, cfg
@@ -556,6 +575,20 @@ def draw_checks(win, y, width, fw, usb):
     return y + 4
 
 
+def touch_line(cfg, stream, touch_setup):
+    """(text, color pair) for the live view's Touch row."""
+    if not cfg.touch:
+        return "off (Configure → Touch input)", 5
+    if touch_setup:
+        return f"needs one-time setup ({touch_setup['problem']}) — press t", 4
+    status = stream.touch_status
+    if status.startswith("ready"):
+        return "on — phones that scanned this QR can tap", 3
+    if status:
+        return status, 4
+    return "starting…", 5
+
+
 def live_screen(win, stream):
     """Live status + pairing QR for the already-running stream.
 
@@ -565,6 +598,7 @@ def live_screen(win, stream):
     disconnect = False
     uri, ips, refreshed = "", [], 0.0
     fw, usb, checked, fw_fixed = None, ("…", "hint", None), 0.0, False
+    touch_setup = None
     win.nodelay(True)
     try:
         while True:
@@ -578,6 +612,7 @@ def live_screen(win, stream):
             if time.monotonic() - checked > 5:
                 fw = None if fw_fixed else core.firewall_check(cfg.port)
                 usb = core.usb_state(cfg.port)
+                touch_setup = core.touch_setup_check(cfg)
                 checked = time.monotonic()
             live = stream.state["live"]
             exited = not stream.running()
@@ -603,8 +638,14 @@ def live_screen(win, stream):
                               f"side={cfg.side}  scale={cfg.scale}")
             addstr(win, 7, 2, f"Stream  : h264 @ {cfg.bitrate()}  port {cfg.port}")
 
-            # QR on the right when there's room, else below the text.
-            qr_x = 64 if w >= 64 + 45 else 2
+            # QR on the right when there's room, else below the text. Its width
+            # depends on the payload (number of addresses, pairing key).
+            qr_lines = qr.render_halfblocks(qr.encode(uri, "M"), quiet=2)
+            qr_x = 64 if w > 64 + len(qr_lines[0]) else 2
+            left_w = (qr_x - 4) if qr_x > 2 else w - 6   # keep text off the QR
+            touch_text, touch_color = touch_line(cfg, stream, touch_setup)
+            addstr(win, 8, 2, f"Touch   : {touch_text}"[:left_w],
+                   curses.color_pair(touch_color))
             qr_y = 3 if qr_x > 2 else 10
             if qr_x > 2:
                 addstr(win, 9, 2, "Scan the QR code with the phone app  →",
@@ -612,11 +653,9 @@ def live_screen(win, stream):
             else:
                 addstr(win, qr_y - 1, 2, "Scan with the phone app:",
                        curses.A_BOLD)
-            qr_lines = qr.render_halfblocks(qr.encode(uri, "M"), quiet=2)
             fits = (qr_y + len(qr_lines) < h - 1
                     and qr_x + len(qr_lines[0]) < w)
             size = (len(qr_lines), len(qr_lines[0])) if fits else None
-            left_w = (qr_x - 4) if qr_x > 2 else w - 6   # keep text off the QR
             text_y = 10 if qr_x > 2 else qr_y + (size[0] if size else 0) + 1
             if not size:
                 addstr(win, text_y, 4, "(enlarge the terminal to show the QR "
@@ -646,6 +685,7 @@ def live_screen(win, stream):
                         "monitor" + ("   f open firewall" if fw and not live
                                      else "")
                         + ("   u fix USB link" if usb[2] and not live else "")
+                        + ("   t set up touch" if touch_setup else "")
                         + ("   — daemon stopped, any key" if exited else ""))
             win.refresh()
 
@@ -656,6 +696,11 @@ def live_screen(win, stream):
             if c in (ord("f"), ord("F")) and fw:
                 if run_shell(win, fw["fix"]) == 0:
                     fw_fixed, fw = True, None     # nft/iptables: not re-detectable
+                continue
+            if c in (ord("t"), ord("T")) and touch_setup:
+                if run_shell(win, touch_setup["fix"]) == 0:
+                    stream.restart(cfg)           # daemon re-creates the device
+                checked = 0.0
                 continue
             if c in (ord("u"), ord("U")) and usb[2]:
                 run_shell(win, usb[2], "done — rescan the QR on the phone; "
