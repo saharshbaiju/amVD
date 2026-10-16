@@ -110,4 +110,4 @@ if (( ! on_path )); then
 fi
 say "Done. Open a new terminal and run:  amvd"
 (( on_path )) || say "(or right now:  $BIN/amvd)"
-say "Phone app: https://github.com/$REPO/releases/latest  (Screen-Extender-*.apk)"
+say "Phone app: https://github.com/$REPO/releases/latest  (amVD-*.apk)"
