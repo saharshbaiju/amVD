@@ -1,271 +1,372 @@
-# Arch Screen Extender — Architecture & Pipeline
+# Screen Extender — Architecture & Pipeline
 
-This document explains the whole system, from the conceptual idea down to every
-stage of the pipeline and the exact bytes that move between them.
+This document explains the whole system, from the idea down to every stage of
+the pipeline, the exact bytes on the wire, and the reliability rules that keep a
+connection up. Platform setup (Arch / Ubuntu / Fedora) lives in
+[`PLATFORMS.md`](./PLATFORMS.md); the phone app in [`ANDROID.md`](./ANDROID.md).
 
 ---
 
 ## 1. The core idea
 
-We want a phone to behave like a **real second monitor** for an Arch Linux /
-Hyprland machine — drag a window "onto" the phone, watch it appear there with
-near-zero lag.
+We want a phone to behave like a **real second monitor** for a Linux desktop —
+drag a window "onto" the phone, watch it appear there with near-zero lag.
 
-A monitor, to the operating system, is just **an output the compositor can draw
-into**. It does not have to be physical. So the plan is:
+A monitor, to the compositor, is just **an output it can draw into**. It does not
+have to be physical. So:
 
-1. **Invent a monitor that doesn't physically exist** (a *headless output*). The
+1. **Create a monitor that doesn't physically exist** (a virtual output). The
    compositor renders into it exactly like a real screen.
-2. **Continuously capture** whatever the compositor draws there.
-3. **Compress** those frames into a video stream (on the GPU, so it's cheap).
-4. **Ship** the stream to the phone over a wire (USB) or the network (WiFi).
-5. **Decode and display** the stream on the phone with **no buffering**, so what
-   you see is only a few milliseconds behind reality.
+2. **Capture** whatever is drawn there and **compress** it to H.264 (on the GPU
+   where possible).
+3. **Ship** it to the phone over USB tethering or Wi-Fi.
+4. **Decode and display** with **no buffering**.
 
-The phone is a *thin client*: it never knows it's a "monitor". It just decodes a
-video and draws it. All the "monitor-ness" lives on the Linux side.
+The phone is a *thin client*: it just decodes video. All the "monitor-ness"
+lives on the Linux side, in a **backend** per compositor:
 
 ```
-   ┌─────────────────────────────────────────────┐        ┌──────────────┐
-   │  Arch Linux + Hyprland                       │        │  Android     │
-   │                                              │        │  phone       │
-   │  [headless output EXT-1]  ← apps draw here   │        │              │
-   │            │ frames (GPU memory)             │        │              │
-   │            ▼                                 │        │              │
-   │  [capture + H.264 encode]  (AMD iGPU)        │        │              │
-   │            │ raw H.264 NAL units             │        │              │
-   │            ▼                                 │        │              │
-   │  [extenderd.py: split + broadcast]           │        │              │
-   │            │ TCP bytes                       │        │              │
-   └────────────┼─────────────────────────────────┘        │              │
-                │  USB (adb reverse)  or  WiFi (LAN)        │              │
-                └──────────────────────────────────────────▶  [MediaCodec]│
-                                                            │      │       │
-                                                            │      ▼       │
-                                                            │  [Surface]   │
-                                                            │  = your eyes │
-                                                            └──────────────┘
+ ┌──────────────── Linux ─────────────────────────────┐        ┌── Android ──┐
+ │                                                     │        │             │
+ │  backend: hyprland            backend: gnome        │        │             │
+ │  hyprctl output create        Mutter ScreenCast     │        │             │
+ │  headless EXT-1               RecordVirtual         │        │             │
+ │        │ wlr-screencopy             │ PipeWire       │        │             │
+ │  wf-recorder + VA-API         GStreamer + VA/x264/  │        │             │
+ │        │                      openh264              │        │             │
+ │        └────────── raw Annex-B H.264 ──┘            │        │             │
+ │                       │ pipe                        │        │             │
+ │             extenderd.py  (parse, GOP cache,        │  TCP   │ MediaCodec  │
+ │             per-client senders, heartbeats) ────────┼───────▶│  → Surface  │
+ │                       ▲                             │        │             │
+ │             tui.py (config, QR pairing, lifecycle)  │        │             │
+ └─────────────────────────────────────────────────────┘        └─────────────┘
 ```
 
 ---
 
 ## 2. Why the previous approach was slow (and this isn't)
 
-An earlier version reached only ~1 second of lag. The important realization:
-**capture and encoding were never the bottleneck.** The latency lived in three
-avoidable places.
+An earlier version reached only ~1 s of lag. **Capture and encoding were never
+the bottleneck**; the latency lived in avoidable places:
 
-| Old design                         | Problem                                            | This design                                   |
-| ---------------------------------- | -------------------------------------------------- | --------------------------------------------- |
-| Phone played the stream with mpv / VLC | Media players add a 0.5–2 s **jitter buffer** by design — this *was* most of the second | A **dedicated app** feeds frames straight to the hardware decoder with **no buffer** |
-| Stream wrapped in **mpegts** container | The player must demux 188-byte TS packets before decoding | **Raw Annex-B** H.264 — the decoder eats it directly |
-| Encoded with **NVENC** (NVIDIA)    | Hyprland renders on the **AMD** iGPU, so every frame was copied AMD → NVIDIA before encoding | Encode with **VA-API on the same AMD iGPU** — zero copy |
-| VKMS kernel virtual monitor        | CPU-rendered, caused session crashes               | `hyprctl output create headless` — GPU-backed, stable |
+| Old design | Problem | This design |
+| --- | --- | --- |
+| Phone played the stream with mpv / VLC | Players add a 0.5–2 s **jitter buffer** by design | A **dedicated app** feeds frames to the hardware decoder with **no buffer** |
+| **mpegts** container | Demuxing 188-byte TS packets before decoding | **Raw Annex-B** H.264 |
+| Encoder on the wrong GPU | Every frame copied across GPUs | Encoder on **the GPU the compositor renders on** (§3) — zero copy |
+| VKMS kernel virtual monitor | CPU-rendered, crashed the session | Compositor-native virtual outputs |
 
-The guiding principle of the rewrite: **never let a frame sit in a buffer
-waiting.** Every stage forwards its output the instant it's ready, and if a
-consumer ever falls behind, we *drop* to the next keyframe instead of queuing a
-backlog. Latency therefore cannot accumulate over time.
+Guiding principle: **never let a frame sit in a buffer waiting.** Every stage
+forwards its output the instant it's ready; a consumer that falls behind is
+*resynced at the next keyframe* instead of being fed a growing backlog.
 
 ---
 
-## 3. The hardware reality on this machine
-
-This laptop has **two GPUs**:
+## 3. Encode on the GPU the compositor renders on (Hyprland)
 
 ```
-renderD129  →  NVIDIA RTX 4060 (dGPU)
-renderD128  →  AMD Radeon 890M (iGPU)   ← Hyprland renders here
+card0 / renderD129  →  NVIDIA RTX 4060 (dGPU)
+card1 / renderD128  →  AMD Radeon 890M (iGPU)
 ```
 
-Hyprland's environment shows `AQ_DRM_DEVICES=/dev/dri/card1:/dev/dri/card0`,
-where `card1` is the AMD device. That means the compositor's framebuffers —
-including the headless output — live in **AMD GPU memory**.
+wf-recorder can hand frames to the encoder zero-copy (**DMA-BUF**) only when
+the encoder sits on the **same GPU** Hyprland renders on. Across GPUs it logs
+`compositor running on different device, disabling DMA-BUF`, falls back to CPU
+copies in `bgra`, and VA-API then fails with `Unsupported format: bgra / Cannot
+create hw frames context` — capture dies before the first frame.
 
-`vainfo` confirms the AMD iGPU has hardware **H.264/HEVC encode** entrypoints
-(`VAEntrypointEncSlice`). So we encode *where the frames already are*. Choosing
-NVENC would force a cross-GPU copy of every single frame; choosing VA-API on the
-AMD node keeps the whole capture→encode path zero-copy via **DMA-BUF** (a Linux
-mechanism for sharing GPU buffers between drivers without copying through RAM).
+Which GPU renders depends on the user's config: the **first entry of
+`AQ_DRM_DEVICES`** (exported by Hyprland to every child process), or the boot VGA
+device when it's unset. The backend (`pick_encoder` in `backends/hyprland.py`)
+therefore decides at start-up:
 
-This is why the daemon defaults to `--device /dev/dri/renderD128`.
+| Compositor GPU (kernel driver) | Encoder | Notes |
+| --- | --- | --- |
+| `nvidia` | `h264_nvenc` — `preset=p1 tune=ull zerolatency=1 rc=cbr delay=0 forced-idr=1` | NVIDIA's VA driver (`nvidia-vaapi-driver`) only *decodes* |
+| `amdgpu` / `i915` / `xe` | `h264_vaapi` on that GPU's render node | `LIBVA_DRIVER_NAME` forced to `radeonsi` / `iHD` (`i965` when iHD isn't installed) |
+| anything, if the above fails to start | `libx264` on the CPU (`preset=ultrafast tune=zerolatency`, `-x yuv420p`) | NVIDIA without NVENC, nouveau, VMs, VA drivers without H.264 encode |
+
+Each candidate gets 2.5 s: an encoder that can't initialise makes wf-recorder
+exit immediately, and the backend moves on to the next one instead of leaving
+the phone on a black screen (`encoder X failed to start; trying the next one`).
+
+Forcing `LIBVA_DRIVER_NAME` matters: NVIDIA Hyprland setups typically export
+`LIBVA_DRIVER_NAME=nvidia` globally, which makes `vainfo` (and FFmpeg) load the
+decode-only NVDEC driver even on the AMD/Intel node. Override the choice with
+`extenderd.py --encoder h264_vaapi|h264_nvenc` (`--device` then picks the VA node).
+
+The dev machine runs Hyprland on the NVIDIA GPU (`AQ_DRM_DEVICES=card0:card1`),
+so it streams via NVENC. NVENC in CBR mode emits a filler NAL after almost every
+frame; the daemon drops filler, SEI and AUD NALs (`NAL_DROP`) before they reach
+the network.
 
 ---
 
 ## 4. The pipeline, stage by stage
 
-### Stage 0 — The headless output (`EXT-1`)
+### Stage 0a — Virtual monitor, Hyprland backend (`backends/hyprland.py`)
 
 ```bash
 hyprctl output create headless EXT-1
-hyprctl keyword monitor EXT-1,1920x1080@60,<pos>,<scale>
+hyprctl eval 'hl.monitor({ output = "EXT-1", mode = "2400x1080@60", position = "1920x0", scale = 1.5 })'
 ```
 
-`hyprctl output create headless` asks Hyprland (a wlroots compositor) to create
-a **virtual wlroots output**. To every application, window manager rule, and the
-compositor's own rendering, `EXT-1` is indistinguishable from a plugged-in
-monitor. Windows can be moved onto it, workspaces can live on it, the cursor can
-travel into it. It just has no cable.
+`EXT-1` is indistinguishable from a plugged-in monitor. Details that matter:
 
-The daemon's `ensure_output()` creates it on start if missing and applies the
-requested mode, and `remove_output()` deletes it on exit so you don't
-accumulate phantom monitors.
+- **Hyprland ≥ 0.55 uses a Lua config parser**, so `hyprctl keyword monitor` and
+  `hyprctl dispatch …` *silently fail*. Everything goes through
+  `hyprctl eval '<lua>'` (`hl.monitor`, `hl.workspace_rule`,
+  `hl.dispatch(hl.dsp.workspace.move{…})`), falling back to the legacy keyword
+  form for older Hyprland.
+- **Side placement** uses explicit coordinates, not `auto-right`: the primary is
+  first *pinned* at its current position (with `auto` placement Hyprland
+  re-places it every time EXT moves, so the two leapfrog), then EXT is placed
+  flush using its *live, scale-snapped* logical size (Hyprland snaps 1.5 → 1.6
+  when that keeps logical pixels integral). The primary goes back to `auto` on
+  teardown.
+- **Workspace split:** workspaces 1–10 are bound to the laptop, 11–20 to the
+  phone — set *before* the output is created so EXT opens on 11.
+- On disconnect, EXT's workspaces are moved back to the primary before the
+  output is removed, so no window vanishes.
 
-> Why not VKMS? VKMS is a *kernel* virtual display rendered by the CPU. It's
-> slower and, in the earlier experiments, crashed the session. A wlroots
-> headless output is rendered by the same GPU path as real outputs.
+### Stage 0b — Virtual monitor, GNOME backend (`backends/gnome.py`)
 
-### Stage 1 — Capture + encode (`wf-recorder` + VA-API)
+Mutter has no "create output" command, but its ScreenCast D-Bus API can create a
+**virtual monitor** — the mechanism GNOME Remote Desktop uses for "extend":
+
+```
+org.gnome.Mutter.ScreenCast.CreateSession({})              -> session
+session.RecordVirtual({cursor-mode: 1 (embedded), is-platform: true}) -> stream
+session.Start()   ->  stream emits PipeWireStreamAdded(node_id)
+```
+
+The monitor appears once a PipeWire consumer negotiates a format, and **its
+resolution is whatever the consumer asks for** — so the `width,height` caps in
+our GStreamer pipeline literally set the monitor's mode. The daemon watches
+`org.gnome.Mutter.DisplayConfig` for the new connector (`Meta-0`…), then places
+it with `ApplyMonitorsConfig` (method *temporary*: nothing written to
+`monitors.xml`, no "keep changes?" dialog). The layout is rebuilt atomically —
+other monitors keep their position, EXT is butted flush against the primary on
+the chosen side, everything is shifted so the top-left is `0,0` (Mutter rejects
+offset or non-adjacent layouts), and the scale is snapped to one Mutter supports
+for that mode.
+
+The virtual monitor lives exactly as long as the daemon's D-Bus connection: when
+the daemon exits (even if killed), Mutter removes it and rehomes its windows.
+
+### Stage 1 — Capture + encode
+
+**Hyprland:** `wf-recorder` (wlr-screencopy, DMA-BUF) → FFmpeg `h264_vaapi` or
+`h264_nvenc`, whichever matches the compositor's GPU (§3):
 
 ```bash
-wf-recorder -o EXT-1 -c h264_vaapi -d /dev/dri/renderD128 \
-    -p bf=0 -p g=30 -p rc_mode=CBR -p b=12M -p async_depth=1 \
+LIBVA_DRIVER_NAME=radeonsi wf-recorder -o EXT-1 -c h264_vaapi -d /dev/dri/renderD128 \
+    -p g=30 -p bf=0 -p b=12M -p rc_mode=CBR -p async_depth=1 \
     -r 60 --muxer=h264 -f /dev/stdout
+# compositor on NVIDIA:
+wf-recorder -o EXT-1 -c h264_nvenc -p g=30 -p bf=0 -p b=12M -p preset=p1 -p tune=ull \
+    -p zerolatency=1 -p rc=cbr -p delay=0 -p forced-idr=1 -r 60 --muxer=h264 -f /dev/stdout
 ```
 
-`wf-recorder` uses the **`wlr-screencopy`** Wayland protocol to grab frames from
-a *named* output. (We tried `gpu-screen-recorder` first — it's excellent, but on
-this setup it does not enumerate headless outputs, while `wf-recorder` does.)
+The **scale** is snapped first (`valid_scale`): Hyprland only accepts scales
+that give whole logical pixels in both dimensions (in 1/120 steps). 2772×1280 at
+1.5 would be 853.3 px tall, so Hyprland shows *"invalid scale"*, substitutes its
+own guess, and the side position computed from 1.5 then overlaps the laptop
+screen (*"Monitor EXT-1 overlaps with other monitor(s)"*). The daemon uses the
+nearest valid scale instead (4/3 here) and logs the substitution.
 
-The captured DMA-BUF is handed to FFmpeg's **`h264_vaapi`** encoder running on
-the AMD iGPU. The flags are all about latency and clean joins:
+**GNOME:** `gst-launch-1.0` reading the PipeWire node:
 
-| Flag                | Meaning                          | Why it matters for latency                       |
-| ------------------- | -------------------------------- | ------------------------------------------------ |
-| `bf=0`              | **no B-frames**                  | B-frames need future frames to decode → reorder delay. Zero B-frames = decode-as-you-receive. |
-| `g=30`              | keyframe (IDR) every 30 frames   | At 60fps that's every 0.5 s — a fresh client can start quickly and packet loss self-heals fast. |
-| `rc_mode=CBR`, `b=12M` | constant 12 Mbit bitrate      | Predictable bandwidth; no bitrate spikes to stall the link. |
-| `async_depth=1`     | minimal encoder pipelining       | The encoder doesn't hold several frames in flight. |
-| `--muxer=h264`      | **raw Annex-B**, no container    | Output is a bare H.264 elementary stream the decoder can read directly. |
-| `-f /dev/stdout`    | write to stdout                  | The daemon reads the stream straight off the pipe. |
+```
+pipewiresrc path=<node> do-timestamp=true keepalive-time=1000
+  ! video/x-raw,width=W,height=H            ← sizes the virtual monitor
+  ! queue max-size-buffers=1 leaky=downstream
+  ! <encoder chain>
+  ! h264parse config-interval=-1             ← SPS/PPS before every IDR
+  ! video/x-h264,stream-format=byte-stream,alignment=au
+  ! fdsink fd=3                              ← a pipe to the daemon
+```
 
-The output on stdout is a continuous **Annex-B byte stream**: a sequence of NAL
-units, each prefixed by a start code `00 00 00 01`.
+The encoder is picked by probing which GStreamer elements exist, hardware first:
+`vah264enc` → `vah264lpenc` → `vaapih264enc` → `x264enc` → `openh264enc` (the VA
+plugins only register an element when the driver can really encode H.264, so
+"element exists" is a reliable probe). Override with `--encoder`.
+
+Every encoder is configured the same way, for the same reasons:
+
+| Setting | Why |
+| --- | --- |
+| **no B-frames** | B-frames need *future* frames → reorder delay |
+| keyframe every `gop` frames (30) | fast joins and fast recovery from loss |
+| CBR at the quality preset's bitrate | no bitrate spikes that stall the link |
+| **one slice per frame** (`sliced-threads=false` for x264) | the phone's hardware decoder wants one complete access unit per input buffer |
+| raw Annex-B, no container | the decoder eats it directly |
+| `keepalive-time=1000` (GNOME) | Mutter only sends frames on damage; resend the last one every second |
 
 ### Stage 2 — NAL parsing + broadcast (`extenderd.py`)
 
-The daemon reads `wf-recorder`'s stdout and turns the byte stream into discrete
-**NAL units** (Network Abstraction Layer units — the atomic pieces of H.264).
+The daemon splits the Annex-B byte stream into **NAL units**:
 
 ```
 …00 00 00 01 [67 …SPS…] 00 00 00 01 [68 …PPS…] 00 00 00 01 [65 …IDR…] 00 00 00 01 [41 …P…]…
-              \_______/                \_____/                \_____/                \____/
-               type 7                   type 8                 type 5                 type 1
+               type 7                  type 8                 type 5                 type 1
 ```
 
-The NAL type is `header_byte & 0x1F`. The ones we care about:
+| Type | Name | Role |
+| --- | --- | --- |
+| 7 | **SPS** | resolution, profile — the decoder can't start without it |
+| 8 | **PPS** | slice decoding parameters |
+| 5 | **IDR** | a keyframe: decodable on its own |
+| 1 | non-IDR | a P-frame: only the *difference* from earlier frames |
 
-| Type | Name     | Role                                                            |
-| ---- | -------- | -------------------------------------------------------------- |
-| 7    | **SPS**  | Sequence Parameter Set — resolution, profile, frame structure. |
-| 8    | **PPS**  | Picture Parameter Set — slice decoding parameters.             |
-| 5    | **IDR**  | A **keyframe** — a complete picture, decodable on its own.      |
-| 1    | non-IDR  | A **P-frame** — only the *difference* from previous frames.     |
+The parser uses `bytes.find` (C speed — the old per-byte Python loop burned ~1
+CPU-second per second at 20 Mbit/s). A NAL is complete when the next start code
+appears; but the *last* NAL of a burst has no successor until the next frame, so
+when the pipe stays quiet for 5 ms the buffered tail is flushed as complete
+(encoders write an access unit as back-to-back `write()`s microseconds apart, and
+a frame interval is ≥ 8 ms even at 120 fps). Without this, the final frame of
+every burst — e.g. the last state after you stop moving a window — only reached
+the phone when *something else* changed.
 
-A decoder is useless without **SPS + PPS** (it can't know the format), and it
-can't start mid-stream on a P-frame (it has no previous frame to diff against).
-So the daemon implements two rules that make joining instant and correct:
-
-1. **Cache the latest SPS and PPS** as they go by (`Broadcaster.sps/pps`).
-2. **Start every new client on a keyframe.** When a phone connects, the daemon
-   waits for the next IDR, then sends `SPS, PPS, IDR` back-to-back, and only then
-   begins forwarding the live stream. The client's decoder is valid from its very
-   first frame. (At `g=30`/60fps the wait is ≤0.5 s.)
-
-This logic lives in `Broadcaster.feed()`:
+`Broadcaster.feed()` then applies these rules:
 
 ```
 for each NAL:
-    if SPS → cache;  if PPS → cache
-    for each connected client:
-        if client not started:
-            if this NAL is an IDR and we have SPS+PPS:
-                send SPS, send PPS, send IDR  → client started
-            else:
-                skip (wait for a keyframe)
-        else:
-            send NAL
+    cache SPS / PPS
+    if IDR (first slice): GOP cache = [SPS, PPS, IDR]
+    else:                 GOP cache += NAL     (dropped if it grows past 16 MB)
+    for each client:
+        started  → enqueue NAL
+        not yet  → wait for an IDR, then enqueue SPS, PPS, IDR → started
+on connect:
+    enqueue banner (settings JSON), then replay the whole GOP cache → started
 ```
 
-**No buffering, no latency creep.** NALs are forwarded the instant they're
-parsed. Sends use `TCP_NODELAY` (Nagle's algorithm disabled) so small writes
-aren't held back. If a client's socket errors (it fell behind / disconnected),
-it's dropped — the daemon never grows an unbounded queue for it.
+**GOP replay** is what makes joining instant even on a static desktop: the new
+phone receives the last keyframe and every P-frame since, decodes them in a
+burst, and is showing the *current* picture within milliseconds (measured: 2 ms
+from accept to first picture data). Before this, a phone joining an idle desktop
+waited for damage that might never come — a black screen.
 
-The accept loop runs on its own thread and supports **multiple clients at once**
-(you could mirror to two phones).
+### Stage 3 — Transport (framed TCP)
 
-### Stage 3 — Transport (TCP over USB or WiFi)
+Every message is **`4-byte type` + `4-byte big-endian length` + body**:
 
-The wire format is just the NAL bytes over a **plain TCP** socket. TCP is used
-because it works *identically* over both links the user wanted:
+| Type | Body | When |
+| --- | --- | --- |
+| `NALU` | one Annex-B NAL, start code included → straight to the decoder | video |
+| `ASX1` | JSON settings: `side width height fps scale quality bitrate codec gop host backend` | on connect, and on any live config change |
+| `PING` | empty | after 1 s with nothing else to send |
 
-- **USB:** `adb reverse tcp:5000 tcp:5000` makes the phone's own `127.0.0.1:5000`
-  transparently tunnel to the PC's port 5000 over the USB cable. The phone app
-  connects to `127.0.0.1` and never knows the bytes crossed USB. This is the most
-  deterministic, lowest-jitter path (~ single-digit ms).
-- **WiFi:** the phone connects to the PC's LAN IP on port 5000 directly.
+Unknown types are ignored by the phone, so new types stay compatible.
 
-`start-extender.sh` sets up whichever mode you ask for (`usb` runs the
-`adb reverse`; `wifi` prints the LAN IP to type into the app).
+**Per-client sender threads.** Each phone has a queue of *whole frames* drained
+by its own thread with blocking `sendall` (5 s timeout). The parser only ever
+enqueues, so one slow phone can't stall the encoder pipe or other phones. If a
+queue exceeds 4 MB (weak Wi-Fi), the *queued* frames are dropped — never the one
+mid-send — and that phone restarts at the next keyframe. Previously the daemon
+truncated a half-sent frame when resyncing; the phone then read garbage as a
+frame length and dropped the connection, which on a busy link repeated forever.
 
-> TCP has one known weakness here: on lossy WiFi, a lost packet stalls
-> everything behind it (head-of-line blocking), which can cause a brief freeze.
-> That's why the roadmap moves WiFi to **RTP/UDP + FEC** later, while keeping TCP
-> for USB where loss is essentially zero.
+**Liveness.** `PING` after 1 s of silence + a 4 s read timeout on the phone, plus
+TCP keepalive (3 s idle, 1 s × 3 probes) on the daemon side: a dead link is
+detected on both ends within seconds instead of hanging half-open.
+
+**Links.** The daemon binds `0.0.0.0:5000`:
+
+- **USB tethering** (no USB debugging): the phone becomes a USB network gadget
+  and hands the PC an address on `192.168.42.0/24`.
+- **Wi-Fi**: the phone connects to the PC's LAN address.
+- `adb reverse tcp:5000 tcp:5000` also works (phone connects to `127.0.0.1`).
+
+**Pairing QR.** The TUI encodes `asext://c?h=<ip1>,<ip2>&p=5000&n=<hostname>&v=1`
+with every plausible address (USB tether first or LAN first, per *Preferred
+link*; Docker/VPN/VM bridges excluded) and draws it with Unicode half-blocks
+(`qr.py`, dependency-free, verified with `zbarimg`). The app connects to *all*
+listed hosts in parallel and keeps the first that answers — so the same QR works
+over USB and Wi-Fi.
+
+> TCP's weakness: on lossy Wi-Fi a lost packet stalls everything behind it
+> (head-of-line blocking). The roadmap moves Wi-Fi to RTP/UDP + FEC.
 
 ### Stage 4 — Decode + display (Android)
 
-The phone reads the Annex-B stream, splits it back into NAL units, feeds them
-into the hardware **`MediaCodec`** H.264 decoder, and renders each decoded frame
-straight onto a `Surface` with **no buffering**. The details are in
-[`ANDROID.md`](./ANDROID.md).
+The phone feeds whole access units to the hardware `MediaCodec` decoder and
+renders every frame on arrival. See [`ANDROID.md`](./ANDROID.md).
 
 ---
 
 ## 5. End-to-end latency budget
 
-Approximate glass-to-glass timing for the base over USB:
+Glass-to-glass over USB (Hyprland + VA-API):
 
-| Stage                              | Typical    |
-| ---------------------------------- | ---------- |
-| Capture (DMA-BUF, zero-copy)       | 1–2 ms     |
-| VA-API encode (no B-frames)        | 3–8 ms     |
-| NAL parse + TCP send (no buffer)   | < 1 ms     |
-| USB transport (adb reverse)        | 2–5 ms     |
-| MediaCodec decode (low-latency)    | 5–10 ms    |
-| Surface render (waits for vsync)   | 8–16 ms    |
-| **Total**                          | **~25–45 ms** |
+| Stage | Typical |
+| --- | --- |
+| Capture (DMA-BUF, zero-copy) | 1–2 ms |
+| VA-API encode (no B-frames) | 3–8 ms |
+| NAL parse + enqueue + TCP send | < 1 ms |
+| USB tethering transport | 2–5 ms |
+| MediaCodec decode (low-latency) | 5–10 ms |
+| Surface render (vsync) | 8–16 ms |
+| **Total** | **~25–45 ms** |
 
-The single biggest source of *remaining* latency is display vsync on the phone,
-which is fundamental. The thing that used to dominate — a player's jitter buffer
-— is gone entirely.
-
----
-
-## 6. Process & lifecycle summary
-
-```
-start-extender.sh ──spawns──▶ extenderd.py ──spawns──▶ wf-recorder
-       │                          │  (reads wf stdout)      │ (captures EXT-1,
-   (adb reverse                   │                          │  VA-API encode)
-    or print IP)                  │
-                                  ├─ accept thread: TCP :5000, multi-client
-                                  └─ on exit: kill wf-recorder, remove EXT-1
-```
-
-- One `extenderd.py` ⟶ one `wf-recorder` child. Killing the daemon (`SIGINT`/
-  `SIGTERM`) tears down capture and removes the headless output.
-- If you ever see `Address already in use`, a previous daemon is still holding
-  port 5000 — `pkill -f extenderd.py` and restart.
+On GNOME with a software encoder add ~5–15 ms for `videoconvert` + x264
+(`threads=2` frame threading costs about one frame). A VA-API GStreamer encoder
+brings it back in line with Hyprland.
 
 ---
 
-## 7. Where to go next
+## 6. Process & lifecycle
 
-- **RTP/UDP + FEC** for lossy WiFi (keep TCP for USB).
-- **HEVC** (`vah265enc`) for lower bitrate at equal quality.
-- **Resolution auto-match** to the phone's panel + DPI.
-- **Touch / pen input** back to the PC (uinput / virtual-pointer protocol).
-- **Hotplug UX** so plugging the phone in spins everything up automatically.
+```
+tui.py ──spawns──▶ extenderd.py --keep-output --banner-file …
+                       │
+                       ├─ backend.setup()          create the virtual monitor
+                       ├─ backend.start_capture()  wf-recorder | gst-launch-1.0  → pipe
+                       ├─ accept thread            TCP :5000, one sender thread per phone
+                       ├─ control thread           SIGHUP → re-read banner → apply side/scale live
+                       └─ on exit                  stop capture, close clients,
+                                                   remove monitor (unless --keep-output on Hyprland)
+```
+
+- The TUI owns the daemon so it survives leaving the live view. `q` keeps
+  streaming; `d` disconnects and removes the monitor.
+- **Live edits:** `side`/`scale` are applied without restarting — the TUI rewrites
+  `~/.config/archscreenextender/daemon-banner.json` (atomically) and sends
+  `SIGHUP`; the daemon's control thread moves/rescales the monitor through the
+  backend and pushes a fresh `ASX1` frame to connected phones. Resolution, fps,
+  quality, gop, port or backend changes restart the daemon; on Hyprland the
+  monitor survives (`--keep-output`), on GNOME it is recreated.
+- A stale daemon from a previous run is killed by `/proc` argv inspection (never
+  `pkill -f`, which matches the parent shell and kills it too).
+
+---
+
+## 7. Bugs fixed in this revision (and why they happened)
+
+The "connects, then disconnects by itself" report had several independent
+causes; each is fixed and documented next to the code:
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| App loops connect → disconnect | A finished session's `onStopped` nulled the *current* session; the reconnect then created a second decoder on the same Surface, which failed, and so on | Every callback carries its session; stale ones are ignored. The Surface is released synchronously in `surfaceDestroyed` |
+| Drops under load / weak Wi-Fi | Resync truncated a half-sent frame → phone parsed garbage lengths | Queues hold whole frames; only queued (unsent) frames are dropped |
+| Black screen after connecting to an idle desktop | No damage → no frames → no keyframe for the new client | GOP cache replayed on connect; GNOME `keepalive-time` |
+| Last frame of a motion "missing" until the next change | Tail NAL held until the next start code | Quiet-pipe tail flush |
+| Silent hangs | No liveness check on either end | `PING` heartbeat + phone read timeout + TCP keepalive |
+| Freezes at native phone resolution | Decoder input buffers sized for a 1080p guess; big IDRs silently dropped | `KEY_MAX_INPUT_SIZE` from the real resolution (banner) |
+| "Reconnecting…" forever with a wrong address | Any failure, even the very first, auto-retried | Auto-retry only after a stream has worked; first-time failures show a specific error |
+| Hyprland: capture dies at once (`Unsupported format: bgra`) | Encoder on a different GPU than the compositor (Hyprland on NVIDIA, VA-API on the iGPU with the NVDEC VA driver) | Encoder follows the compositor GPU: NVENC on NVIDIA, VA-API (with the right `LIBVA_DRIVER_NAME`) elsewhere |
+| Hyprland: *"invalid scale"* / *"EXT-1 overlaps"* popups | Requested scale gave fractional logical pixels; position computed from it. Also a restart overlapping the old daemon's teardown | Nearest valid scale; a new daemon waits for the old one to exit |
+| Resolution/scale/side ignored on Hyprland ≥ 0.55 | `hyprctl keyword`/`dispatch` broken by the Lua parser (fix existed but was left in a git stash) | `hyprctl eval` Lua API (restored and committed) |
+
+---
+
+## 8. Where to go next
+
+- **RTP/UDP + FEC** for lossy Wi-Fi (keep TCP for USB).
+- **HEVC** decode in the app (the Hyprland backend can already encode it).
+- **KDE Plasma** backend (KWin virtual outputs via `kwin_wayland` screencast).
+- **Touch / pen input** back to the PC (uinput / virtual-pointer).
 - **Latency HUD** overlay for tuning.

@@ -1,0 +1,69 @@
+# amVD — Distribution & releasing
+
+## How users get it
+
+| Piece | Channel | What the user does |
+| --- | --- | --- |
+| PC side (Python, no build step) | `install.sh` from the `main` branch; downloads the latest release's `amvd-linux.tar.gz` (falls back to the `main` tarball if there's no release yet) | `curl -fsSL https://raw.githubusercontent.com/saharshbaiju/amVD/main/install.sh \| bash`, then `amvd` |
+| Phone app | GitHub Releases: `amVD-<version>.apk`, signed with the amVD release key | Download on the phone, install |
+
+The installer is distro-agnostic: it asks `linux/core.py` which packages are
+missing for *this* distro and desktop (the same list as the TUI's Dependencies
+screen) and installs them with apt / dnf / pacman. Nothing is compiled, so the
+same tarball works on Ubuntu, Fedora and Arch.
+
+Verified: `install.sh` on Ubuntu 24.04 (fresh container) installs the
+packages and the `amvd` command, which then resolves in a new shell. The GNOME
+backend streams on Ubuntu 24.04 (Mutter 46, x264enc) and Fedora 42 (Mutter 48,
+openh264enc).
+
+## Signing key — keep it safe
+
+Android only installs an update if it's signed with the **same key** as the
+installed app. The release key lives outside the repo:
+
+```
+~/.config/amvd-release/amvd-release.jks      keystore (alias "amvd")
+~/.gradle/gradle.properties                  ASEXT_KEYSTORE / ASEXT_KEYSTORE_PASSWORD / ASEXT_KEY_ALIAS
+```
+
+**Back up both** (password manager / encrypted drive). Losing them means every
+user has to uninstall before the next version installs. Never commit them.
+Without these properties `assembleRelease` falls back to the debug key, which is
+fine for local testing but must not be published.
+
+A phone that has a *debug* build (Android Studio / `assembleDebug`) must
+uninstall it once before installing a release APK (different signature).
+
+## Cutting a release
+
+1. Bump `versionCode` (+1) and `versionName` in `android/app/build.gradle.kts`.
+2. Build and package:
+
+   ```bash
+   V=0.3.0
+   (cd android && JAVA_HOME=/opt/android-studio/jbr ./gradlew assembleRelease)
+   mkdir -p dist
+   cp android/app/build/outputs/apk/release/app-release.apk dist/amVD-$V.apk
+   tar --exclude=__pycache__ -czf dist/amvd-linux.tar.gz linux
+   (cd dist && sha256sum amVD-$V.apk amvd-linux.tar.gz > SHA256SUMS)
+   ```
+
+3. Commit, tag and publish:
+
+   ```bash
+   git tag -a v$V -m "amVD $V" && git push origin main v$V
+   gh release create v$V dist/amVD-$V.apk dist/amvd-linux.tar.gz dist/SHA256SUMS \
+       --title "amVD $V" --notes-file <notes>
+   ```
+
+`install.sh` always fetches `releases/latest/download/amvd-linux.tar.gz`, so a
+new release is picked up by re-running the install line.
+
+## Possible next channels
+
+- **AUR** package (`amvd-git`) for Arch.
+- **F-Droid** for the app (needs a reproducible build without Play-services
+  code scanner, or a flavor that drops it).
+- **Google Play** (internal testing track) once the app is stable.
+- A `.deb` / COPR repo if users want updates through their package manager.

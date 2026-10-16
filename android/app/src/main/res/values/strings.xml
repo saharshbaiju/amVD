@@ -1,9 +1,24 @@
 <resources>
     <string name="app_name">Screen Extender</string>
-    <string name="subtitle">Connect to your Arch / Hyprland PC</string>
-    <string name="connect_cta">CONNECT  →</string>
-    <string name="host_hint">127.0.0.1</string>
-    <string name="port_hint">5000</string>
+    <string name="tagline">Use this phone as a second monitor for your Linux desktop.</string>
+    <string name="card_title_new">Connect to your computer</string>
+    <string name="card_body_new">On your computer run ./asext, choose Start extender, then scan the QR code shown in the terminal.</string>
+    <string name="card_title_ready">Ready to connect</string>
+    <string name="card_body_ready">Make sure the extender is running on your computer.</string>
+    <string name="scan_qr">Scan QR code</string>
+    <string name="scan_again">Scan again</string>
+    <string name="enter_manually">Enter address manually</string>
     <string name="connect">Connect</string>
     <string name="disconnect">Disconnect</string>
+    <string name="address">IP address</string>
+    <string name="port">Port</string>
+    <string name="status_idle">Not connected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="sheet_overline">Extended display</string>
+    <string name="stat_resolution">Resolution</string>
+    <string name="stat_refresh">Refresh rate</string>
+    <string name="stat_scale">Scale</string>
+    <string name="stat_position">Position</string>
+    <string name="stat_quality">Quality</string>
+    <string name="stat_desktop">Desktop</string>
 </resources>

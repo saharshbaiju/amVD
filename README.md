@@ -1,125 +1,152 @@
-# Arch Screen Extender
+# Screen Extender
 
-Turn an Android phone into a **real low-latency secondary monitor** for an Arch
-Linux / Hyprland (wlroots) machine — like spacedesk on Windows, but native and
-GPU-accelerated end to end.
+Turn an Android phone into a **real, low-latency second monitor** for Linux —
+like spacedesk on Windows, but native and GPU-accelerated end to end.
 
-This is the **low-latency base**: display only, no touch input yet.
+| Desktop | Distros | How the virtual monitor is made |
+| --- | --- | --- |
+| **Hyprland** | Arch (and anything running Hyprland) | `hyprctl output create headless` + wf-recorder / VA-API |
+| **GNOME on Wayland** | **Ubuntu 22.04+**, **Fedora 36+**, any GNOME 40+ | Mutter's virtual-monitor API + PipeWire + GStreamer |
+
+Display only for now (no touch input yet). Pair by **scanning a QR code** in the
+terminal; connect over a **USB cable** (adb, automatic when USB debugging is on),
+**USB tethering** (no USB debugging needed) or **Wi-Fi**.
 
 ## Documentation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the whole system from the
-  conceptual idea down to every pipeline stage, the two-GPU reasoning, the NAL
-  flow, and the end-to-end latency budget.
-- [`docs/ANDROID.md`](docs/ANDROID.md) — the mobile app: packages, platform APIs,
-  the three source files, and how a frame travels from TCP byte to your eyes.
+- [`docs/PLATFORMS.md`](docs/PLATFORMS.md) — install & setup on **Arch / Ubuntu /
+  Fedora**, how the GNOME backend works, troubleshooting.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the whole pipeline, the wire
+  protocol, the reliability rules, the latency budget, and the bugs fixed.
+- [`docs/ANDROID.md`](docs/ANDROID.md) — the phone app: UI, components, decode
+  path, developer workflow.
+- [`docs/RELEASING.md`](docs/RELEASING.md) — how releases are built, signed and
+  published (APK + Linux tarball on GitHub Releases).
+
+## Install
+
+### On the computer (Ubuntu, Fedora, Arch)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/saharshbaiju/amVD/main/install.sh | bash
+```
+
+Then open a new terminal and run **`amvd`**.
+
+The installer puts the program in `~/.local/share/amvd`, adds the `amvd` command
+(and adds `~/.local/bin` to your shell's PATH if needed), creates a *Screen
+Extender* app-menu entry, and installs the packages your distro and desktop need
+with `apt` / `dnf` / `pacman` (it asks for your password once). Re-run the same
+line to update; `./install.sh --uninstall` removes it. From a git checkout,
+`./install.sh` installs that checkout instead.
+
+> **Ubuntu / Fedora:** log in to the GNOME **Wayland** session (the default; on
+> Ubuntu it's "Ubuntu", not "Ubuntu on Xorg"). **Fedora:** the H.264 encoder
+> comes from the `fedora-cisco-openh264` repo, enabled by default on Workstation.
+
+### On the phone (Android 8+)
+
+Download **`amVD-<version>.apk`** from the
+[latest release](https://github.com/saharshbaiju/amVD/releases/latest) on the
+phone, open it, and allow "install unknown apps" for your browser when asked.
+
+### Connect
+
+1. Run `amvd` → **Start extender**. A QR code appears.
+2. Pick how the phone reaches the computer:
+   - **USB cable** (lowest latency): enable *USB debugging* on the phone and plug
+     it in — `amvd` sets up `adb reverse` by itself. Works even when the phone is
+     on mobile data.
+   - **USB tethering**: *Settings → Hotspot & tethering → USB tethering* (no
+     developer options needed).
+   - **Wi-Fi**: phone and computer on the same network (allow port 5000 in the
+     firewall: `sudo ufw allow 5000/tcp` on Ubuntu).
+3. In the app tap **Scan QR code**, scan the terminal, tap **Connect**. Ripples
+   spread from your finger, then the screen dissolves into your extended desktop.
+
+Pointing the phone's **stock camera** at the QR works too — it's an `asext://`
+link that opens the app with your computer filled in.
+
+Without the TUI: `~/.local/share/amvd/linux/start-extender.sh usb` prints the
+same QR and runs the daemon in the foreground.
 
 ## How it works
 
 ```
-Hyprland headless output (EXT-1)        a genuine GPU-backed secondary monitor;
-        │                               drag windows onto it like any display
-        │  wlr-screencopy, DMA-BUF (zero copy)
-   wf-recorder + VA-API H.264           hardware encode on the AMD iGPU that
-        │  (no B-frames, CBR)           Hyprland already renders on -> no GPU copy
+virtual monitor (Hyprland headless output / Mutter virtual monitor)
+        │  zero-copy capture
+   H.264 encode on the compositor's GPU (NVENC / VA-API, x264 fallback;
+                GStreamer VA / x264 / openh264 on GNOME)
+        │  no B-frames, one slice per frame, CBR
+   extenderd.py   splits NAL units, caches the current GOP, one sender
+        │         thread per phone, 1 s heartbeats, resync on keyframes
+   TCP  — USB tethering, Wi-Fi, or adb reverse (every QR address tried in parallel)
         │
-   extenderd.py                         splits raw Annex-B into NAL units,
-        │  caches SPS/PPS, no buffering  starts each client on a keyframe
-        │
-   TCP  (USB via USB tethering, or WiFi LAN)
-        │
-   Android app  →  MediaCodec  →  Surface   hardware decode, rendered on arrival,
-                                             KEY_LOW_LATENCY, zero jitter buffer
+   Android app → MediaCodec → Surface    hardware decode, rendered on arrival
 ```
 
-### Why this is fast (and the old approach wasn't)
+Target glass-to-glass latency: **~25–45 ms** over USB with hardware encoding.
 
-The previous attempt topped out around **~1 second** of lag. The capture and
-encode were never the problem — the latency lived in two places:
+### Why it's fast
 
-1. **A generic player on the phone (mpv/VLC).** Media players build a large
-   jitter/demux buffer by design; that buffer *was* most of the second. The fix
-   is a dedicated app that feeds NAL units straight into `MediaCodec` with no
-   buffering — what this app does.
-2. **A container (mpegts) + the wrong GPU.** We drop the container entirely
-   (raw Annex-B) and encode with VA-API on the **AMD iGPU** that Hyprland renders
-   on, so frames never get copied to the NVIDIA GPU.
+The old approach (~1 s lag) used a media player with a jitter buffer, an mpegts
+container, and encoded on the wrong GPU. This one feeds raw H.264 straight into
+the phone's hardware decoder with no buffering, and encodes on the GPU the
+compositor already renders on. Details in
+[`ARCHITECTURE.md` §2](docs/ARCHITECTURE.md#2-why-the-previous-approach-was-slow-and-this-isnt).
 
-Target end-to-end latency for this base: **well under 50 ms** on USB / good 5 GHz.
+### Why it stays connected
 
-## Requirements (Arch)
+The previous build "connected, then disconnected by itself". The causes — a
+session race on the phone, frames truncated mid-send on resync, no heartbeat,
+undersized decoder buffers, and broken `hyprctl` commands on Hyprland 0.55+ — are
+all fixed; see the table in
+[`ARCHITECTURE.md` §7](docs/ARCHITECTURE.md#7-bugs-fixed-in-this-revision-and-why-they-happened).
+If the link drops after streaming (cable pulled, Wi-Fi roam, settings change),
+the app shows *Reconnecting…* over the last frame and resumes by itself.
+
+## The terminal UI
 
 ```bash
-sudo pacman -S wf-recorder libva-mesa-driver python   # capture + VA-API + daemon
-# adb is optional — only for "Match connected phone" auto-sizing (needs USB
-# debugging):  sudo pacman -S android-tools
+amvd
 ```
 
-Hyprland must be the running compositor (it provides the headless output).
+- **Start extender** — launches the daemon and opens the live view: status, the
+  pairing **QR code**, the plain addresses, and the daemon log. `q` returns to the
+  menu *keeping the stream running*; `d` disconnects and removes the monitor.
+- **Configure** — desktop backend (auto / hyprland / gnome), screen **side**
+  (left / right / up / down), **resolution** (presets or *Match connected phone*
+  via adb), **FPS**, desktop **scale**, **quality** (bitrate), keyframe interval,
+  **preferred link** (which address goes first in the QR), **port**. Saving while
+  streaming applies side/scale instantly; other changes restart the stream.
+  Stored in `~/.config/archscreenextender/config.json`.
+- **Dependencies** — per distro (pacman / apt / dnf) and per backend; `i`
+  installs what's missing.
+- **Detected hardware** — desktop, primary monitor, VA-API node, USB tether
+  link, phone panel size (adb), LAN IP.
 
-### USB without USB debugging
-
-The wired path uses **Android USB tethering**, not `adb` — so **no developer
-mode / USB debugging is required**. On the phone, enable
-*Settings → Connections → Mobile Hotspot and Tethering → USB tethering*. The
-phone then hands this PC an address on `192.168.42.0/24`, and the app connects to
-that PC address (the TUI / launcher prints it).
-
-> Note: while USB tethering is on, Linux may route internet through the phone.
-> If that's unwanted, lower that interface's route priority (or turn off the
-> phone's mobile data) — the stream itself only needs the local `192.168.42.x`
-> link, not internet.
-
-## Run — Linux side (TUI, recommended)
-
-```bash
-cd linux
-./asext            # launches the terminal UI
-```
-
-The TUI does everything interactively:
-
-- **Dependencies** — checks for `wf-recorder`, `vainfo`, `adb`, etc. and installs
-  any missing ones with `sudo pacman`. On first run it opens here automatically if
-  a required package is missing.
-- **Detected hardware** — your primary monitor + mode, the VA-API encode node, a
-  USB-connected phone's panel size, and your LAN IP.
-- **Configure** — screen **side** (left/right/up/down), **resolution** (presets or
-  *Match connected phone* over USB), **FPS**, desktop **scale**, **quality**
-  (low/medium/high/ultra → bitrate), **codec**, keyframe interval, **transport**
-  (USB/WiFi), and **port**. Saved to `~/.config/archscreenextender/config.json`.
-- **Start extender** — launches the daemon and shows a live status screen with the
-  exact address to type on the phone (the USB-tether IP for USB, the LAN IP for
-  WiFi).
-
-### Or run the daemon directly (advanced / scripting)
+### Daemon directly (advanced / scripting)
 
 ```bash
 cd linux
-./start-extender.sh usb            # USB tethering: prints the PC tether IP
-./start-extender.sh wifi           # prints the LAN IP to enter on the phone
+./start-extender.sh usb|wifi [flags]     # prints the QR, runs in the foreground
+python3 extenderd.py --help
 ```
 
-Useful flags (forwarded to `extenderd.py`):
-
 ```
---width 1920 --height 1080 --fps 60          # virtual monitor mode
---side via --position auto-right|auto-left|auto-up|auto-down
---bitrate 12M --codec h264|hevc --gop 30     # encoder
---device /dev/dri/renderD128                 # VA-API node (AMD iGPU; the default)
+--backend auto|hyprland|gnome            # auto-detected from the session
+--width 2400 --height 1080 --fps 60      # virtual monitor mode
+--side right|left|up|down --scale 1.5    # placement (applied live on SIGHUP)
+--bitrate 12M --gop 30                   # encoder
+--encoder auto|vah264enc|x264enc|…       # GNOME: GStreamer element to use
+--encoder auto|h264_nvenc|h264_vaapi|libx264  # Hyprland: compositor GPU, x264 fallback
+--device /dev/dri/renderD128             # Hyprland: VA-API node (h264_vaapi)
 --port 5000
 ```
 
-The headless output `EXT-1` is created on start and removed on exit. Place it
-relative to your real screen with Hyprland as usual, e.g.:
+## The Android app
 
-```bash
-hyprctl keyword monitor EXT-1,1920x1080@60,2560x0,1
-```
-
-## Run — Android side
-
-Open `android/` in Android Studio and Run, **or** build from the CLI:
+Users install the APK from GitHub Releases (above). To build it yourself:
 
 ```bash
 cd android
@@ -127,79 +154,52 @@ JAVA_HOME=/opt/android-studio/jbr ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-> The CLI build needs JDK 17–21. The system JDK here is 26 (too new for the
-> Gradle/AGP versions), so point `JAVA_HOME` at Android Studio's bundled JBR.
+(Or open `android/` in Android Studio and press Run.) The CLI build needs JDK
+17–21; point `JAVA_HOME` at Android Studio's bundled JBR if your system JDK is
+newer. Requires Android 8.0+; the QR scanner uses Google Play services (no
+camera permission). Material You colors on Android 12+, the shader-based water
+transition on Android 13+ (a canvas version on older phones).
 
-In the app:
-- **USB:** enable *USB tethering* on the phone, then host = the PC tether IP the
-  launcher printed (a `192.168.42.x`), port `5000`, Connect. No USB debugging.
-- **WiFi:** host = the PC LAN IP the launcher printed, port `5000`, Connect.
-
-Tap the video to bring the connection overlay back.
-
-## Developing & debugging
-
-End users need none of this — it's for working on the code.
-
-### Linux daemon
+## Developing
 
 ```bash
-cd linux
-./asext                                   # TUI: deps, detection, config, live status
-
-# or run the daemon directly and watch its logs (it logs to stderr, [extenderd] prefix)
-./start-extender.sh wifi                  # or: usb
+python3 linux/testsrc.py --width 2400 --height 1080   # fake desktop, real daemon code
+adb shell am start -a android.intent.action.VIEW -d "'asext://c?h=10.0.2.2&p=5000'"   # emulator
+adb logcat -s StreamSession
 ```
 
-The daemon prints capture/encode/client events (SPS/PPS caching, keyframe starts,
-client connect/drop, send-queue depth) to **stderr** prefixed with `[extenderd]`.
-Run it from `start-extender.sh` rather than the TUI when you want those logs in
-your terminal. Re-run with different `--width/--fps/--bitrate/--codec/--gop`
-(see flags above) to A/B latency and quality.
-
-### Android app
-
-Full details — including **wireless `adb` debugging (no cable)** — are in
-[`docs/ANDROID.md`](docs/ANDROID.md) §7. The essentials (need *USB debugging* on):
-
-```bash
-cd android
-JAVA_HOME=/opt/android-studio/jbr ./gradlew installDebug          # build + install
-adb shell am start -n com.archextender/.MainActivity --ez autoconnect true
-adb logcat --pid=$(adb shell pidof com.archextender)              # app logs only
-```
-
-- **Wireless:** Android 11+ → Settings → Developer options → *Wireless debugging*
-  → *Pair device with pairing code*, then `adb pair <ip>:<pair-port>` and
-  `adb connect <ip>:<connect-port>`. Everything above then works over Wi-Fi.
-- This device **blocks `adb` input injection** — drive the app with the
-  `--ez autoconnect true` intent above instead of scripting taps.
-- Wireless `adb` only carries dev commands; the **video stream** still connects
-  to the PC's LAN IP directly (no `adb reverse` on the WiFi path).
+`testsrc.py` streams a test pattern through the real broadcaster without creating
+a monitor, so the app can be developed on any machine (the emulator reaches the
+PC at `10.0.2.2`). More in [`ANDROID.md` §7](docs/ANDROID.md#7-developer-install--debugging).
 
 ## Project layout
 
 ```
 linux/
-  asext               TUI launcher (recommended entry point)
-  tui.py              curses UI: deps install, detection, config, live status
-  core.py             config persistence + hardware/dependency detection
-  extenderd.py        capture -> encode -> NAL parse -> TCP broadcast
-  start-extender.sh   direct USB/WiFi launcher (advanced)
-android/
-  app/src/main/java/com/archextender/
-    MainActivity.kt   fullscreen SurfaceView + connect overlay
-    StreamSession.kt  TCP + MediaCodec decode -> Surface (no buffering)
-    NalReader.kt      Annex-B -> NAL unit splitter
+  amvd                  TUI launcher (installed as the `amvd` command)
+  tui.py                curses UI: deps, detection, config, live view + QR
+  core.py               config, distro/dependency detection, addresses, QR URI
+  qr.py                 dependency-free QR encoder (half-block terminal output)
+  extenderd.py          daemon: backend → NAL parse → GOP cache → TCP broadcast
+  backends/hyprland.py  headless output, hyprctl Lua API, wf-recorder
+  backends/gnome.py     Mutter ScreenCast virtual monitor, DisplayConfig, GStreamer
+  start-extender.sh     no-TUI launcher (prints the QR)
+  testsrc.py            test-pattern server for app development
+android/app/src/main/java/com/archextender/
+  MainActivity.kt       Material 3 UI, scanner, transitions, side sheet
+  StreamSession.kt      parallel connect, framed reader, MediaCodec → Surface
+  RippleRevealLayout.kt water ripple + reveal (AGSL)
+  ConnectTarget.kt      asext:// QR / deep link parsing
+  FrameReader.kt        NALU / ASX1 / PING framing
+  AspectRatioSurfaceView.kt  letterboxing
+docs/                   PLATFORMS, ARCHITECTURE, ANDROID, RELEASING
+install.sh              one-line installer (any distro), adds the `amvd` command
 ```
 
-## Roadmap (after the base proves out)
+## Roadmap
 
-- **RTP/UDP + FEC** transport for lossy WiFi (TCP head-of-line blocking hurts
-  there); keep TCP for USB.
-- **HEVC** option (`vah265enc`) for lower bitrate at the same quality.
-- **Resolution auto-match** to the phone's panel + DPI.
-- **Touch / pen input** back to the PC (uinput / virtual-pointer protocol).
-- A small **system tray / hotplug** UX so plugging the phone "just works".
-- Latency HUD (capture→display timestamp overlay) for tuning.
-```
+- RTP/UDP + FEC for lossy Wi-Fi (keep TCP for USB)
+- HEVC decode in the app
+- KDE Plasma backend
+- Touch / pen input back to the PC
+- Latency HUD

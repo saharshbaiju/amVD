@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# amVD Screen Extender — launch the TUI. Works when symlinked (~/.local/bin/amvd).
+HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+exec python3 "$HERE/tui.py" "$@"

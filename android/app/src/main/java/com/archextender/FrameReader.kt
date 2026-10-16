@@ -45,6 +45,7 @@ class FrameReader(private val src: InputStream) {
     companion object {
         const val TYPE_NAL = "NALU"
         const val TYPE_CONFIG = "ASX1"
+        const val TYPE_PING = "PING"   // keepalive, empty body
         private const val MAX_FRAME = 32 * 1024 * 1024   // sanity cap
     }
 }

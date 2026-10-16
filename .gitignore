@@ -23,3 +23,8 @@ __pycache__/
 # --- Runtime artifacts ---
 *.log
 /tmp/
+
+# --- Release ---
+dist/
+*.jks
+*.keystore

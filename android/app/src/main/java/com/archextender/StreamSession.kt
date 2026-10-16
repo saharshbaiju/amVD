@@ -5,9 +5,15 @@ import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
 import android.view.Surface
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONObject
 
 /** Linux-side settings advertised by the daemon's banner (see extenderd.py). */
@@ -20,45 +26,59 @@ data class ServerConfig(
     val quality: String,
     val bitrate: String,
     val codec: String,
-    val gop: Int,
+    val host: String,
+    val backend: String,
 )
 
 /**
- * One streaming session: connect TCP -> read Annex-B NALs -> feed a hardware
+ * One streaming session: connect TCP -> read framed NALs -> feed a hardware
  * H.264 decoder that renders straight onto [surface].
  *
  * Latency principles:
- *   * No app-side buffering: every NAL is queued to the decoder immediately and
- *     every decoded frame is released to the Surface as soon as it's ready.
- *   * KEY_LOW_LATENCY on Android 11+ tells the decoder to skip its own reorder
- *     buffer (safe because the encoder emits no B-frames).
- *   * TCP_NODELAY so small NAL writes aren't held by Nagle.
+ *   * No app-side buffering: each access unit is queued the moment it's
+ *     complete and every decoded frame is released to the Surface immediately.
+ *   * KEY_LOW_LATENCY on Android 11+ (the encoder emits no B-frames).
  *
- * Runs entirely on its own thread; call [stop] to tear down.
+ * Reliability principles (each fixed a real "connects then drops" bug):
+ *   * Every callback carries `this`, so the activity can ignore a stale
+ *     session that finishes after a newer one already started. Previously an
+ *     old session's onStopped nulled the new one, a third decoder was created
+ *     on the same Surface, failed, and the app looped connect/disconnect.
+ *   * A read timeout (the daemon PINGs every second) detects dead links.
+ *   * Decoder input buffers are sized for the real stream, not a 1080p guess,
+ *     so big keyframes at native phone resolution aren't silently dropped.
+ *   * A new SPS (resolution change) reconfigures the decoder.
  */
 class StreamSession(
-    private val host: String,
+    private val hosts: List<String>,
     private val port: Int,
     private val surface: Surface,
     private val listener: Listener,
 ) : Runnable {
 
     interface Listener {
-        fun onConnected()
-        fun onStopped(reason: String?)
-        fun onStreamInfo(width: Int, height: Int)
-        fun onServerConfig(config: ServerConfig)
+        fun onConnected(session: StreamSession, host: String)
+        fun onFirstFrame(session: StreamSession)
+        fun onStreamInfo(session: StreamSession, width: Int, height: Int)
+        fun onServerConfig(session: StreamSession, config: ServerConfig)
+        fun onStopped(session: StreamSession, reason: String?)
     }
 
     @Volatile private var running = true
-    private var socket: Socket? = null
+    @Volatile private var socket: Socket? = null
     private var codec: MediaCodec? = null
-    private var configured = false
+    private var configuredSps: ByteArray? = null
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
+    private var serverConfig: ServerConfig? = null
+    private var firstFrame = false
     private var ptsUs = 0L
     private val info = MediaCodec.BufferInfo()
-    private val au = java.io.ByteArrayOutputStream(1 shl 17)   // current access unit
+    private val au = java.io.ByteArrayOutputStream(1 shl 18)   // current access unit
+
+    /** The host that answered (one of [hosts]). */
+    @Volatile var connectedHost: String? = null
+        private set
 
     private val thread = Thread(this, "stream-session").apply { start() }
 
@@ -67,36 +87,95 @@ class StreamSession(
         try { socket?.close() } catch (_: Exception) {}
     }
 
-    fun join() = try { thread.join(1500) } catch (_: InterruptedException) {}
+    /** Stop and wait for the decoder to be released (call before the Surface dies). */
+    fun stopAndJoin() {
+        stop()
+        try { thread.join(2000) } catch (_: InterruptedException) {}
+    }
 
     override fun run() {
         var reason: String? = null
         try {
-            val s = Socket()
-            s.tcpNoDelay = true
-            s.connect(InetSocketAddress(host, port), 5000)
+            val s = connectAny()
             socket = s
-            listener.onConnected()
+            if (!running) return
+            s.soTimeout = READ_TIMEOUT_MS
+            listener.onConnected(this, connectedHost ?: "")
 
-            // Framed protocol: NALU = video, ASX1 = Linux settings (which can
-            // arrive at any time, including live config changes mid-stream).
             val reader = FrameReader(s.getInputStream().buffered(1 shl 16))
             while (running) {
-                val f = reader.next() ?: break
+                val f = reader.next() ?: throw IOException("the computer closed the connection")
                 when (f.type) {
                     FrameReader.TYPE_NAL -> handleNal(nalType(f.body), f.body)
-                    FrameReader.TYPE_CONFIG ->
-                        parseConfig(f.body)?.let { listener.onServerConfig(it) }
+                    FrameReader.TYPE_CONFIG -> parseConfig(f.body)?.let {
+                        serverConfig = it
+                        listener.onServerConfig(this, it)
+                    }
+                    FrameReader.TYPE_PING -> {}   // keepalive: resets the read timeout
                     // unknown frame types are ignored for forward compatibility
                 }
             }
+        } catch (e: SocketTimeoutException) {
+            reason = "connection lost (no data for ${READ_TIMEOUT_MS / 1000}s)"
+        } catch (e: MediaCodec.CodecException) {
+            reason = "video decoder error"
+            Log.e(TAG, "codec error", e)
         } catch (e: Exception) {
-            reason = e.message ?: e.javaClass.simpleName
-            Log.e(TAG, "session error", e)
+            if (running) {
+                reason = e.message ?: e.javaClass.simpleName
+                Log.w(TAG, "session ended: $reason")
+            }
         } finally {
             release()
-            listener.onStopped(reason)
+            listener.onStopped(this, if (running) reason else null)
         }
+    }
+
+    /**
+     * Try every candidate address in parallel (USB-tether IP, Wi-Fi IP, ...)
+     * and keep whichever answers first, so the QR "just works" on any link.
+     */
+    private fun connectAny(): Socket {
+        val winner = AtomicReference<Socket?>(null)
+        val lastError = AtomicReference<Exception?>(null)
+        val refusedBy = AtomicReference<String?>(null)
+        val remaining = AtomicInteger(hosts.size)
+        val done = CountDownLatch(1)
+        for (h in hosts) {
+            Thread({
+                val s = Socket()
+                try {
+                    s.tcpNoDelay = true
+                    s.receiveBufferSize = 1 shl 20
+                    s.connect(InetSocketAddress(h, port), CONNECT_TIMEOUT_MS)
+                    if (winner.compareAndSet(null, s)) {
+                        connectedHost = h
+                        done.countDown()
+                    } else {
+                        s.close()
+                    }
+                } catch (e: Exception) {
+                    // "refused" is the most useful diagnosis (computer reachable,
+                    // extender not running): never let a timeout overwrite it.
+                    if (e is java.net.ConnectException && "refused" in (e.message ?: "")) {
+                        refusedBy.compareAndSet(null, h)
+                    }
+                    lastError.set(e)
+                    try { s.close() } catch (_: Exception) {}
+                } finally {
+                    if (remaining.decrementAndGet() == 0) done.countDown()
+                }
+            }, "connect-$h").start()
+        }
+        done.await(CONNECT_TIMEOUT_MS + 500L, TimeUnit.MILLISECONDS)
+        val s = winner.get()
+        if (s == null || !running) {
+            s?.close()
+            refusedBy.get()?.let { throw IOException("connection refused by $it") }
+            val why = lastError.get()?.message ?: "timed out"
+            throw IOException("couldn't reach ${hosts.joinToString()} : $port ($why)")
+        }
+        return s
     }
 
     /** Parse an ASX1 config frame body (JSON) into [ServerConfig]. */
@@ -111,7 +190,8 @@ class StreamSession(
             quality = o.optString("quality", ""),
             bitrate = o.optString("bitrate", ""),
             codec = o.optString("codec", ""),
-            gop = o.optInt("gop", 0),
+            host = o.optString("host", ""),
+            backend = o.optString("backend", ""),
         )
     } catch (e: Exception) {
         Log.w(TAG, "bad config frame", e)
@@ -127,18 +207,23 @@ class StreamSession(
 
     private fun handleNal(type: Int, nal: ByteArray) {
         when (type) {
-            NAL_SPS -> sps = nal
+            NAL_SPS -> {
+                sps = nal
+                // A different SPS means the resolution/profile changed: rebuild
+                // the decoder at the keyframe that follows.
+                if (codec != null && !nal.contentEquals(configuredSps)) releaseCodec()
+            }
             NAL_PPS -> pps = nal
         }
-        if (!configured) {
+        if (codec == null) {
             val sp = sps; val pp = pps
-            if (sp != null && pp != null) {
+            if (sp != null && pp != null && type == NAL_IDR) {
                 configure(sp, pp)
-                // seed the first access unit with the parameter sets so the very
-                // first frame we queue is a complete SPS+PPS+IDR unit
+                // the first unit we queue is a complete SPS+PPS+IDR
                 au.reset(); au.write(sp); au.write(pp)
+            } else {
+                return  // keep gathering until we can start on a keyframe
             }
-            return  // keep gathering until the decoder exists
         }
 
         // Hardware decoders (e.g. Qualcomm C2) reject partial input: they need a
@@ -152,20 +237,24 @@ class StreamSession(
     }
 
     private fun configure(sp: ByteArray, pp: ByteArray) {
-        // Width/height are hints; the decoder derives the true size from the SPS
-        // and emits INFO_OUTPUT_FORMAT_CHANGED. The Surface scales to fit.
-        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080)
+        // Width/height are hints (the decoder reads the true size from the SPS);
+        // the banner tells us the real size so input buffers are big enough.
+        val w = serverConfig?.width?.takeIf { it > 0 } ?: 1920
+        val h = serverConfig?.height?.takeIf { it > 0 } ?: 1080
+        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h)
         fmt.setByteBuffer("csd-0", ByteBuffer.wrap(sp))
         fmt.setByteBuffer("csd-1", ByteBuffer.wrap(pp))
+        fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxOf(w * h, 1 shl 20))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
         }
+        fmt.setInteger(MediaFormat.KEY_PRIORITY, 0)          // realtime
         val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         c.configure(fmt, surface, null, 0)
         c.start()
         codec = c
-        configured = true
-        Log.i(TAG, "decoder configured")
+        configuredSps = sp
+        Log.i(TAG, "decoder configured for ${w}x$h")
     }
 
     private fun feedAndDrain(frame: ByteArray) {
@@ -178,11 +267,15 @@ class StreamSession(
         }
         if (inIdx < 0) return
         val buf: ByteBuffer = c.getInputBuffer(inIdx) ?: return
-        if (frame.size > buf.capacity()) return   // guard: skip an oversized unit
+        if (frame.size > buf.capacity()) {
+            Log.w(TAG, "access unit ${frame.size}B > input buffer ${buf.capacity()}B, dropped")
+            c.queueInputBuffer(inIdx, 0, 0, ptsUs, 0)
+            return
+        }
         buf.clear()
         buf.put(frame)
         c.queueInputBuffer(inIdx, 0, frame.size, ptsUs, 0)
-        ptsUs += 33_333   // ~30fps spacing; ordering only, no B-frames
+        ptsUs += 16_666   // ordering only; frames render on arrival
         drain(c)
     }
 
@@ -190,17 +283,25 @@ class StreamSession(
         while (true) {
             val outIdx = c.dequeueOutputBuffer(info, 0)
             when {
-                outIdx >= 0 ->
+                outIdx >= 0 -> {
                     // render = true -> hand the frame to the Surface immediately
                     c.releaseOutputBuffer(outIdx, true)
+                    if (!firstFrame && info.size >= 0) {
+                        firstFrame = true
+                        listener.onFirstFrame(this)
+                    }
+                }
                 outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    // The decoder now knows the true resolution (from the SPS).
                     val f = c.outputFormat
                     try {
-                        listener.onStreamInfo(
-                            f.getInteger(MediaFormat.KEY_WIDTH),
-                            f.getInteger(MediaFormat.KEY_HEIGHT),
-                        )
+                        // crop is the real picture (1080 vs the padded 1088)
+                        val w = if (f.containsKey("crop-right"))
+                            f.getInteger("crop-right") - f.getInteger("crop-left") + 1
+                        else f.getInteger(MediaFormat.KEY_WIDTH)
+                        val h = if (f.containsKey("crop-bottom"))
+                            f.getInteger("crop-bottom") - f.getInteger("crop-top") + 1
+                        else f.getInteger(MediaFormat.KEY_HEIGHT)
+                        listener.onStreamInfo(this, w, h)
                     } catch (_: Exception) {
                     }
                 }
@@ -209,16 +310,25 @@ class StreamSession(
         }
     }
 
-    private fun release() {
+    private fun releaseCodec() {
         try { codec?.stop() } catch (_: Exception) {}
         try { codec?.release() } catch (_: Exception) {}
         codec = null
+        configuredSps = null
+        au.reset()
+    }
+
+    private fun release() {
+        releaseCodec()
         try { socket?.close() } catch (_: Exception) {}
     }
 
     companion object {
         private const val TAG = "StreamSession"
+        const val NAL_IDR = 5
         const val NAL_SPS = 7
         const val NAL_PPS = 8
+        private const val CONNECT_TIMEOUT_MS = 3000
+        private const val READ_TIMEOUT_MS = 4000
     }
 }

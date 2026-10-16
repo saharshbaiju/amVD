@@ -1,14 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="bg">#08090A</color>
-    <color name="ink">#F1F3F4</color>
-    <color name="muted">#868D92</color>
-    <color name="amber">#E8B23A</color>
-    <color name="teal">#46BBAC</color>
-    <color name="warn">#E0703A</color>
-    <color name="glass">#E60E1114</color>
-    <color name="glass_strong">#F20C0E11</color>
-    <color name="hairline">#24FFFFFF</color>
-    <color name="field">#12FFFFFF</color>
-    <color name="ink_on_amber">#0A0B0C</color>
+    <!-- Launcher icon background (Google blue). -->
+    <color name="brand">#0B57D0</color>
+
+    <!-- Status dot over the video. -->
+    <color name="live">#34A853</color>
+    <color name="pending">#FBBC04</color>
+    <color name="lost">#EA4335</color>
+    <color name="pill_bg">#E61F1F1F</color>
+    <color name="pill_text">#F1F3F4</color>
+
+    <!-- Fallback palette for Android < 12 (no wallpaper-based dynamic color):
+         Material 3 tonal palette from Google blue, light scheme. -->
+    <color name="fb_primary">#0B57D0</color>
+    <color name="fb_on_primary">#FFFFFF</color>
+    <color name="fb_primary_container">#D3E3FD</color>
+    <color name="fb_on_primary_container">#041E49</color>
+    <color name="fb_secondary_container">#C2E7FF</color>
+    <color name="fb_on_secondary_container">#001D35</color>
+    <color name="fb_surface">#F8FAFD</color>
+    <color name="fb_on_surface">#1F1F1F</color>
+    <color name="fb_on_surface_variant">#444746</color>
+    <color name="fb_surface_low">#F0F4F9</color>
+    <color name="fb_surface_container">#E9EEF6</color>
+    <color name="fb_surface_high">#E3E8EF</color>
+    <color name="fb_surface_highest">#DDE3EA</color>
+    <color name="fb_outline">#747775</color>
 </resources>

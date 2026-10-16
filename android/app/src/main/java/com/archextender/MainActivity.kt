@@ -1,28 +1,44 @@
 package com.archextender
 
-import android.animation.ObjectAnimator
+import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
+import android.content.res.ColorStateList
+import android.content.res.Configuration
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.View
 import android.view.WindowManager
-import android.view.animation.DecelerateInterpolator
+import android.view.animation.PathInterpolator
+import android.util.Log
+import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.archextender.databinding.ActivityMainBinding
+import com.google.android.material.color.DynamicColors
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 
 /**
- * Fullscreen client whose chrome never covers the video.
+ * Connect screen (Material 3) -> water-ripple transition -> full-bleed desktop.
  *
- *  - Idle  -> a full "connect" screen (no video to obscure anyway).
- *  - Live  -> the video is full-bleed. The only persistent element is a slim
- *             edge handle hugging the right border; a status toast appears on
- *             change then dissolves; all real controls live in a drawer that
- *             slides in on demand and closes again.
- *
- * Auto-reconnect and the low-latency [StreamSession] decode path are unchanged.
+ *  IDLE        connect card: scan the TUI's QR (or type an address), Connect.
+ *  CONNECTING  ripples spread from where you tapped while we connect.
+ *  LIVE        first frame decoded -> the connect screen dissolves like water
+ *              into the video. Chrome is just a fading status pill and a slim
+ *              edge handle that opens a side sheet (details + Disconnect).
+ *  RECONNECTING  the link dropped after working; retries with backoff.
  */
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.Listener {
 
@@ -30,303 +46,505 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
     private val ui = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("asext", Context.MODE_PRIVATE) }
 
+    private enum class State { IDLE, CONNECTING, LIVE, RECONNECTING }
+
+    private var state = State.IDLE
+    private var target: ConnectTarget? = null
     private var session: StreamSession? = null
     private var surfaceReady = false
     private var wantConnected = false
-    private var reconnectScheduled = false
-    private var drawerOpen = false
+    private var everStreamed = false       // reconnect only after a stream worked
+    private var reconnectAttempt = 0
+    private var rippleStartedAt = 0L
+    private var lastTouchX = -1f
+    private var lastTouchY = -1f
+    private var sheetOpen = false
 
-    private var host = "127.0.0.1"
-    private var port = 5000
-    private var streamInfo = ""
+    private var streamSize = ""
     private var serverConfig: ServerConfig? = null
-    private var state = State.IDLE
+    private var linkHost = ""
+    private var wifiLock: WifiManager.WifiLock? = null
 
-    private var dotPulse: ObjectAnimator? = null
     private val autoHide = Runnable { fadeChrome() }
-
-    private enum class State { IDLE, CONNECTING, CONNECTED, RECONNECTING }
+    private val reconnect = Runnable { launchSession() }
+    private val noVideoWatchdog = Runnable {
+        if (state == State.CONNECTING && session != null) {
+            failConnect("Connected to ${target?.title}, but no video arrived. " +
+                "Check the terminal on your computer for errors.")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        if (!DynamicColors.isDynamicColorAvailable()) {
+            theme.applyStyle(R.style.ThemeOverlay_ArchExtender_Fallback, true)
+        }
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         b = ActivityMainBinding.inflate(layoutInflater)
         setContentView(b.root)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        b.host.setText(prefs.getString("host", "127.0.0.1"))
-        b.port.setText(prefs.getString("port", "5000"))
-
         b.surface.holder.addCallback(this)
-        b.connectBtn.setOnClickListener { startConnect() }
-        b.disconnectBtn.setOnClickListener { closeDrawer(); userDisconnect() }
-        b.edgeHandle.setOnClickListener { openDrawer() }
-        b.scrim.setOnClickListener { closeDrawer() }
+        b.primaryBtn.setOnClickListener { onPrimary() }
+        b.scanBtn.setOnClickListener { scan() }
+        b.manualBtn.setOnClickListener { toggleManual() }
+        b.editBtn.setOnClickListener { toggleManual(true) }
+        b.portInput.setOnEditorActionListener { _, id, _ ->
+            if (id == EditorInfo.IME_ACTION_GO) { onPrimary(); true } else false
+        }
+        b.disconnectBtn.setOnClickListener { closeSheet(); userDisconnect("disconnect button") }
+        b.edgeHandle.setOnClickListener { openSheet() }
+        b.scrim.setOnClickListener { closeSheet() }
         b.surface.setOnClickListener {
-            if (drawerOpen) closeDrawer() else if (wantConnected) peekChrome()
+            if (sheetOpen) closeSheet() else if (state != State.IDLE) peekChrome()
+        }
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                // An edge swipe in immersive mode is easy to trigger by
+                // accident (dragging a window near the phone's edge), so it
+                // never drops a live stream: it opens the sheet, where
+                // Disconnect is one deliberate tap away.
+                when {
+                    sheetOpen -> closeSheet()
+                    state == State.LIVE || state == State.RECONNECTING -> openSheet()
+                    state == State.CONNECTING -> userDisconnect("back while connecting")
+                    else -> { isEnabled = false; onBackPressedDispatcher.onBackPressed() }
+                }
+            }
+        })
+
+        // park the side sheet off-screen until summoned
+        b.controlSheet.visibility = View.INVISIBLE
+        b.controlSheet.post {
+            b.controlSheet.translationX = b.controlSheet.width + dp(24f)
+            b.controlSheet.visibility = View.VISIBLE
         }
 
-        // park the drawer off-screen on the right until summoned
-        b.controlDrawer.translationX = 1200f
-        b.controlDrawer.post { b.controlDrawer.translationX = b.controlDrawer.width.toFloat() }
+        target = ConnectTarget.load(prefs)
+        handleIntent(intent)
+        render()
+        showSystemBars()
 
-        applyState()
-
-        // launch straight into a connection: am start ... --ez autoconnect true
-        if (intent?.getBooleanExtra("autoconnect", false) == true) startConnect()
+        // debug / adb: am start -n com.archextender/.MainActivity --ez autoconnect true
+        if (intent?.getBooleanExtra("autoconnect", false) == true && target != null) {
+            b.root.post { startConnect(b.root.width * 0.7f, b.root.height * 0.6f) }
+        }
     }
 
-    // ----------------------------------------------------------------- actions
+    // uiMode is in configChanges so a light/dark switch can't kill a live
+    // stream; re-theme only while nothing is streaming.
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (state == State.IDLE && !b.connectScreen.isRippling) recreate()
+    }
 
-    private fun startConnect() {
-        host = b.host.text.toString().trim().ifEmpty { "127.0.0.1" }
-        port = b.port.text.toString().trim().toIntOrNull() ?: 5000
-        prefs.edit().putString("host", host).putString("port", port.toString()).apply()
-        hideKeyboard()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (state == State.IDLE) handleIntent(intent)
+    }
+
+    /** asext://… opened from the camera app or a link: pre-fill the target. */
+    private fun handleIntent(intent: Intent?) {
+        val t = ConnectTarget.parse(intent?.dataString) ?: return
+        setTarget(t)
+    }
+
+    // remember where the user touched, so the ripple starts under their finger
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) { lastTouchX = ev.x; lastTouchY = ev.y }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    // ------------------------------------------------------------ connect card
+
+    private fun onPrimary() {
+        if (b.manualGroup.visibility == View.VISIBLE) {
+            val t = ConnectTarget.manual(b.hostInput.text.toString(), b.portInput.text.toString())
+            if (t == null) {
+                showError("Enter the computer's IP address, e.g. 192.168.42.129")
+                return
+            }
+            setTarget(t)
+            hideKeyboard()
+            b.manualGroup.visibility = View.GONE
+        }
+        if (target == null) { scan(); return }
+        val (x, y) = if (lastTouchX >= 0) lastTouchX to lastTouchY else centerOf(b.primaryBtn)
+        startConnect(x, y)
+    }
+
+    private fun scan() {
+        hideError()
+        val options = GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .enableAutoZoom()
+            .build()
+        GmsBarcodeScanning.getClient(this, options).startScan()
+            .addOnSuccessListener { code ->
+                val t = ConnectTarget.parse(code.rawValue)
+                if (t == null) showError("That QR code isn't from Screen Extender.")
+                else setTarget(t)
+            }
+            .addOnFailureListener {
+                showError("The QR scanner isn't available on this phone " +
+                    "(needs Google Play services). Enter the address manually.")
+                toggleManual(true)
+            }
+    }
+
+    private fun toggleManual(show: Boolean = b.manualGroup.visibility != View.VISIBLE) {
+        b.manualGroup.visibility = if (show) View.VISIBLE else View.GONE
+        if (show) {
+            target?.let {
+                b.hostInput.setText(it.hosts.first())
+                b.portInput.setText(it.port.toString())
+            }
+            b.hostInput.requestFocus()
+        } else {
+            hideKeyboard()
+        }
+        render()
+    }
+
+    private fun setTarget(t: ConnectTarget) {
+        target = t
+        t.save(prefs)
+        hideError()
+        render()
+    }
+
+    /** Sync the connect card with [target] / manual mode. */
+    private fun render() {
+        val t = target
+        val manual = b.manualGroup.visibility == View.VISIBLE
+        b.targetRow.visibility = if (t != null && !manual) View.VISIBLE else View.GONE
+        if (t != null) {
+            b.targetName.text = t.title
+            b.targetAddr.text = "${t.addressLine}  ·  port ${t.port}"
+        }
+        b.cardTitle.setText(if (t != null || manual) R.string.card_title_ready else R.string.card_title_new)
+        b.cardBody.setText(if (t != null || manual) R.string.card_body_ready else R.string.card_body_new)
+        val ready = t != null || manual
+        b.primaryBtn.setText(if (ready) R.string.connect else R.string.scan_qr)
+        b.primaryBtn.setIconResource(if (ready) R.drawable.ic_desktop else R.drawable.ic_qr_scan)
+        b.scanBtn.visibility = if (ready) View.VISIBLE else View.GONE
+        b.manualBtn.visibility = if (manual) View.GONE else View.VISIBLE
+        b.statusChip.setText(when (state) {
+            State.IDLE -> R.string.status_idle
+            else -> R.string.status_connecting
+        })
+    }
+
+    private fun showError(msg: String) {
+        b.errorText.text = msg
+        b.errorText.visibility = View.VISIBLE
+    }
+
+    private fun hideError() { b.errorText.visibility = View.GONE }
+
+    // ---------------------------------------------------------------- sessions
+
+    private fun startConnect(x: Float, y: Float) {
+        if (target == null || state != State.IDLE) return
+        hideError()
         wantConnected = true
+        everStreamed = false
+        reconnectAttempt = 0
+        b.primaryBtn.isEnabled = false
+        rippleStartedAt = SystemClock.uptimeMillis()
+        b.connectScreen.startRipple(x, y)
+        setState(State.CONNECTING)
+        acquireWifiLock()
         launchSession()
     }
 
-    private fun userDisconnect() {
+    private fun launchSession() {
+        val t = target ?: return
+        if (!surfaceReady || !wantConnected || session != null) return
+        session = StreamSession(t.hosts, t.port, b.surface.holder.surface, this)
+    }
+
+    private fun userDisconnect(why: String) {
+        Log.i(TAG, "user disconnect: $why")
         wantConnected = false
-        ui.removeCallbacks(autoHide)
-        reconnectScheduled = false
+        ui.removeCallbacks(reconnect)
+        ui.removeCallbacks(noVideoWatchdog)
+        session?.stop()          // its onStopped is ignored: session is nulled
+        session = null
+        releaseWifiLock()
+        setState(State.IDLE)
+        showConnectScreen()
+    }
+
+    /** First connection never produced video: settle the ripple, explain. */
+    private fun failConnect(reason: String) {
+        wantConnected = false
+        ui.removeCallbacks(noVideoWatchdog)
         session?.stop()
         session = null
-        streamInfo = ""
-        serverConfig = null
+        releaseWifiLock()
+        b.primaryBtn.isEnabled = true
+        b.connectScreen.settle()
         setState(State.IDLE)
+        showError(reason)
     }
 
-    // -------------------------------------------------------------- session io
+    // Every callback checks it comes from the *current* session. A stale one
+    // (stopped when the surface was recreated, say) must not touch state —
+    // that race used to start a second decoder and loop connect/disconnect.
 
-    private fun launchSession() {
-        if (!surfaceReady || !wantConnected || session != null) return
-        setState(State.CONNECTING)
-        session = StreamSession(host, port, b.surface.holder.surface, this)
+    override fun onConnected(session: StreamSession, host: String) = runOnUiThread {
+        if (session !== this.session) return@runOnUiThread
+        linkHost = host
+        if (state == State.CONNECTING) {
+            ui.removeCallbacks(noVideoWatchdog)
+            ui.postDelayed(noVideoWatchdog, 10_000)
+        }
     }
 
-    private fun scheduleReconnect() {
-        if (reconnectScheduled || !wantConnected) return
-        reconnectScheduled = true
-        ui.postDelayed({ reconnectScheduled = false; launchSession() }, 1200)
-    }
-
-    override fun onConnected() = runOnUiThread { setState(State.CONNECTED) }
-
-    override fun onStopped(reason: String?) = runOnUiThread {
-        session = null
-        if (wantConnected) {
-            setState(State.RECONNECTING, reason)
-            scheduleReconnect()
+    override fun onFirstFrame(session: StreamSession) = runOnUiThread {
+        if (session !== this.session) return@runOnUiThread
+        ui.removeCallbacks(noVideoWatchdog)
+        everStreamed = true
+        reconnectAttempt = 0
+        val wasConnecting = state == State.CONNECTING
+        setState(State.LIVE)
+        if (wasConnecting) {
+            // let the drop ripple breathe a moment before the water opens up
+            val wait = (MIN_RIPPLE_MS - (SystemClock.uptimeMillis() - rippleStartedAt))
+                .coerceAtLeast(0)
+            ui.postDelayed({
+                if (state == State.LIVE) b.connectScreen.reveal { onRevealed() }
+            }, wait)
         } else {
-            setState(State.IDLE)
+            showPill()
         }
     }
 
-    override fun onStreamInfo(width: Int, height: Int) = runOnUiThread {
-        streamInfo = "$width × $height"
-        // Re-shape the surface to the real stream aspect ratio so a resolution
-        // change actually takes effect on screen (and tablets stop stretching).
+    private fun onRevealed() {
+        b.primaryBtn.isEnabled = true
+        enterImmersive()
+        showPill()
+    }
+
+    override fun onStreamInfo(session: StreamSession, width: Int, height: Int) = runOnUiThread {
+        if (session !== this.session) return@runOnUiThread
+        streamSize = "$width × $height"
+        // reshape the surface to the real stream aspect (letterbox, no stretch)
         b.surface.setAspectRatio(width, height)
-        if (wantConnected) setState(State.CONNECTED)
+        fillSheet()
     }
 
-    override fun onServerConfig(config: ServerConfig) = runOnUiThread {
+    override fun onServerConfig(session: StreamSession, config: ServerConfig) = runOnUiThread {
+        if (session !== this.session) return@runOnUiThread
         serverConfig = config
-        fillDrawer()
+        fillSheet()
     }
 
-    // ----------------------------------------------------------- state machine
+    override fun onStopped(session: StreamSession, reason: String?) = runOnUiThread {
+        if (session !== this.session) return@runOnUiThread
+        this.session = null
+        if (!wantConnected) return@runOnUiThread
+        if (!everStreamed) {
+            failConnect(friendlyError(reason))
+            return@runOnUiThread
+        }
+        // It worked before: keep the last frame up and retry with backoff
+        // (cable re-plugged, Wi-Fi roam, daemon restarted for a config change).
+        setState(State.RECONNECTING)
+        val delay = BACKOFF_MS[reconnectAttempt.coerceAtMost(BACKOFF_MS.size - 1)]
+        reconnectAttempt++
+        ui.removeCallbacks(reconnect)
+        ui.postDelayed(reconnect, delay)
+    }
 
-    private fun setState(s: State, reason: String? = null) {
+    private fun friendlyError(reason: String?): String {
+        val name = target?.title ?: "your computer"
+        return when {
+            reason == null -> "Couldn't connect to $name."
+            "refused" in reason.lowercase() ->
+                "$name is reachable, but the extender isn't running. " +
+                    "Start it from the terminal (./asext → Start extender)."
+            "couldn't reach" in reason || "timed out" in reason || "unreachable" in reason ->
+                "Couldn't reach $name. Turn on USB tethering, or join the same Wi-Fi."
+            else -> "Couldn't connect to $name: $reason"
+        }
+    }
+
+    // ------------------------------------------------------------------ state
+
+    private fun setState(s: State) {
         state = s
-        if (s == State.IDLE && reason != null && reason.isNotBlank()) {
-            b.errorText.text = reason.lowercase()
-            b.errorText.visibility = View.VISIBLE
-        }
-        applyState()
-    }
-
-    private fun applyState() {
-        when (state) {
-            State.IDLE -> {
-                showConnectScreen()
-                hideChromeNow()
-                closeDrawer()
-                stopPulse()
-                b.connectBtn.text = getString(R.string.connect_cta)
-            }
-            State.CONNECTING -> {
-                hideConnectScreen()
-                stopPulse()
-                showToast("CONNECTING …", R.color.teal)
-                showHandle()
-            }
-            State.CONNECTED -> {
-                hideConnectScreen()
-                fillDrawer()
-                startPulse()
-                val res = if (streamInfo.isNotEmpty()) "  $streamInfo" else ""
-                showToast("● LIVE$res", R.color.amber)
-                showHandle()
-                scheduleAutoHide()
-            }
-            State.RECONNECTING -> {
-                hideConnectScreen()
-                stopPulse()
-                showToast("RECONNECTING …", R.color.warn)
-                showHandle()
-            }
+        render()
+        fillSheet()
+        if (s == State.RECONNECTING) showPill()
+        if (s == State.IDLE) {
+            // no live chrome on the connect screen (a tap while connecting
+            // could leave a stale "Connecting…" pill over the error)
+            ui.removeCallbacks(autoHide)
+            b.statusPill.animate().cancel()
+            b.statusPill.visibility = View.GONE
+            b.edgeHandle.visibility = View.GONE
         }
     }
-
-    // ------------------------------------------------------------ connect view
 
     private fun showConnectScreen() {
-        if (b.connectScreen.visibility == View.VISIBLE) return
+        b.statusPill.visibility = View.GONE
+        b.edgeHandle.visibility = View.GONE
+        b.primaryBtn.isEnabled = true
+        b.connectScreen.reset()
         b.connectScreen.alpha = 0f
-        b.connectScreen.visibility = View.VISIBLE
-        b.connectScreen.animate().alpha(1f).setDuration(220).start()
+        b.connectScreen.animate().alpha(1f).setDuration(250).start()
+        showSystemBars()
     }
 
-    private fun hideConnectScreen() {
-        b.errorText.visibility = View.GONE
-        if (b.connectScreen.visibility != View.VISIBLE) return
-        b.connectScreen.animate().alpha(0f).setDuration(200)
-            .withEndAction { b.connectScreen.visibility = View.GONE; enterImmersive() }
-            .start()
+    // ------------------------------------------------------------- live chrome
+
+    private fun showPill() {
+        val (text, color) = when (state) {
+            State.LIVE -> "Live" + (if (streamSize.isNotEmpty()) "  ·  $streamSize" else "") to R.color.live
+            State.RECONNECTING -> "Reconnecting…" to R.color.pending
+            State.CONNECTING -> "Connecting…" to R.color.pending
+            State.IDLE -> return
+        }
+        b.statusText.text = text
+        b.dot.backgroundTintList = ColorStateList.valueOf(getColor(color))
+        appear(b.statusPill)
+        appear(b.edgeHandle, 0.9f)
+        ui.removeCallbacks(autoHide)
+        if (state == State.LIVE && !sheetOpen) ui.postDelayed(autoHide, 2800)
     }
 
-    // -------------------------------------------------------------- hud chrome
-
-    private fun showToast(text: String, colorRes: Int) {
-        b.statusToast.text = text
-        b.statusToast.setTextColor(getColor(colorRes))
-        appear(b.statusToast)
-    }
-
-    private fun showHandle() = appear(b.edgeHandle, 0.5f)
+    private fun peekChrome() = showPill()
 
     private fun appear(v: View, target: Float = 1f) {
-        if (v.visibility != View.VISIBLE) { v.visibility = View.VISIBLE; v.alpha = 0f }
-        v.animate().alpha(target).setDuration(180).start()
-    }
-
-    private fun scheduleAutoHide() {
-        ui.removeCallbacks(autoHide)
-        if (state == State.CONNECTED && !drawerOpen) ui.postDelayed(autoHide, 3200)
-    }
-
-    /** Dissolve the toast and dim the handle so the video is unobstructed. */
-    private fun fadeChrome() {
-        b.statusToast.animate().alpha(0f).setDuration(450)
-            .withEndAction { b.statusToast.visibility = View.GONE }.start()
-        b.edgeHandle.animate().alpha(0.16f).setDuration(450).start()
-    }
-
-    private fun hideChromeNow() {
-        ui.removeCallbacks(autoHide)
-        b.statusToast.visibility = View.GONE
-        b.edgeHandle.visibility = View.GONE
-    }
-
-    /** Bring chrome back briefly when the user taps the video. */
-    private fun peekChrome() {
-        val res = if (streamInfo.isNotEmpty()) "  $streamInfo" else ""
-        when (state) {
-            State.CONNECTED -> showToast("● LIVE$res", R.color.amber)
-            State.RECONNECTING -> showToast("RECONNECTING …", R.color.warn)
-            else -> showToast("CONNECTING …", R.color.teal)
+        if (v.visibility != View.VISIBLE) {
+            v.visibility = View.VISIBLE
+            v.alpha = 0f
+            v.translationY = if (v === b.statusPill) -dp(12f) else 0f
         }
-        showHandle()
-        scheduleAutoHide()
+        v.animate().alpha(target).translationY(0f).setDuration(220)
+            .setInterpolator(EMPHASIZED).start()
     }
 
-    // ------------------------------------------------------------------ drawer
+    /** Fade the pill out and dim the handle so the desktop is unobstructed. */
+    private fun fadeChrome() {
+        b.statusPill.animate().alpha(0f).translationY(-dp(12f)).setDuration(400)
+            .withEndAction { b.statusPill.visibility = View.GONE }.start()
+        b.edgeHandle.animate().alpha(0.25f).setDuration(400).start()
+    }
 
-    private fun openDrawer() {
-        if (drawerOpen) return
-        drawerOpen = true
+    // -------------------------------------------------------------- side sheet
+
+    private fun openSheet() {
+        if (sheetOpen) return
+        sheetOpen = true
         ui.removeCallbacks(autoHide)
-        fillDrawer()
+        fillSheet()
         b.scrim.alpha = 0f
         b.scrim.visibility = View.VISIBLE
-        b.scrim.animate().alpha(1f).setDuration(200).start()
-        b.controlDrawer.animate().translationX(0f).setDuration(260)
-            .setInterpolator(DecelerateInterpolator()).start()
-        b.edgeHandle.animate().alpha(0f).setDuration(160).start()
+        b.scrim.animate().alpha(1f).setDuration(220).start()
+        b.controlSheet.animate().translationX(0f).setDuration(380)
+            .setInterpolator(EMPHASIZED).start()
+        b.edgeHandle.animate().alpha(0f).setDuration(150).start()
     }
 
-    private fun closeDrawer() {
-        if (!drawerOpen) {
-            b.scrim.visibility = View.GONE
-            return
-        }
-        drawerOpen = false
+    private fun closeSheet() {
+        if (!sheetOpen) return
+        sheetOpen = false
         b.scrim.animate().alpha(0f).setDuration(200)
             .withEndAction { b.scrim.visibility = View.GONE }.start()
-        b.controlDrawer.animate().translationX(b.controlDrawer.width.toFloat())
-            .setDuration(240).setInterpolator(DecelerateInterpolator()).start()
-        if (state == State.CONNECTED) { showHandle(); scheduleAutoHide() }
+        b.controlSheet.animate().translationX(b.controlSheet.width + dp(24f))
+            .setDuration(300).setInterpolator(EMPHASIZED).start()
+        if (state != State.IDLE) showPill()
     }
 
-    private fun fillDrawer() {
-        b.drawerState.text = when (state) {
-            State.CONNECTED -> "LIVE"
-            State.RECONNECTING -> "RECONNECT"
-            State.CONNECTING -> "CONNECTING"
-            State.IDLE -> "OFFLINE"
-        }
-        b.drawerRes.text = streamInfo.ifEmpty { "—" }
-        b.drawerHost.text = "$host:$port"
-        // 192.168.42.x is Android's USB-tethering subnet (the wired path, no USB
-        // debugging); anything else is treated as a Wi-Fi LAN address.
-        b.drawerLink.text = if (host.startsWith("192.168.42."))
-            "USB · tethering" else "Wi-Fi · LAN"
-
-        // Linux-side settings, advertised by the daemon's banner on connect.
+    private fun fillSheet() {
         val sc = serverConfig
-        b.drawerSide.text = sc?.side?.uppercase()?.ifEmpty { "—" } ?: "—"
-        b.drawerFps.text = sc?.takeIf { it.fps > 0 }?.let { "${it.fps} Hz" } ?: "—"
-        b.drawerScale.text = sc?.takeIf { it.scale > 0 }?.let { fmtScale(it.scale) } ?: "—"
-        b.drawerQuality.text = sc?.takeIf { it.quality.isNotEmpty() }?.let {
-            val br = if (it.bitrate.isNotEmpty()) " · ${it.bitrate}" else ""
-            "${it.quality.uppercase()}$br"
+        b.sheetTitle.text = sc?.host?.ifBlank { null } ?: target?.title ?: "—"
+        val link = when {
+            linkHost.startsWith("192.168.42.") -> "USB tethering"
+            linkHost == "127.0.0.1" -> "USB (adb)"
+            linkHost.isNotEmpty() -> "Wi-Fi"
+            else -> ""
+        }
+        b.sheetSubtitle.text = when (state) {
+            State.LIVE -> "Connected via $link  ·  $linkHost"
+            State.RECONNECTING -> "Reconnecting…"
+            State.CONNECTING -> "Connecting…"
+            State.IDLE -> "Not connected"
+        }
+        b.sheetRes.text = streamSize.ifEmpty { sc?.takeIf { it.width > 0 }?.let { "${it.width} × ${it.height}" } ?: "—" }
+        b.sheetFps.text = sc?.takeIf { it.fps > 0 }?.let { "${it.fps} Hz" } ?: "—"
+        b.sheetScale.text = sc?.takeIf { it.scale > 0 }?.let { fmtScale(it.scale) } ?: "—"
+        b.sheetSide.text = sc?.side?.takeIf { it.isNotEmpty() }
+            ?.let { "${it.replaceFirstChar(Char::uppercase)} of main" } ?: "—"
+        b.sheetQuality.text = sc?.takeIf { it.quality.isNotEmpty() }?.let {
+            it.quality.replaceFirstChar(Char::uppercase) +
+                if (it.bitrate.isNotEmpty()) " · ${it.bitrate}bps" else ""
         } ?: "—"
-        b.drawerCodec.text = sc?.codec?.uppercase()?.ifEmpty { "—" } ?: "—"
+        b.sheetBackend.text = when (sc?.backend) {
+            "hyprland" -> "Hyprland"
+            "gnome" -> "GNOME"
+            null, "" -> "—"
+            else -> sc.backend
+        }
     }
 
-    /** "1.0" -> "1×", "1.25" -> "1.25×" (drop a trailing ".0"). */
+    /** 1.0 -> "1×", 1.25 -> "1.25×". */
     private fun fmtScale(scale: Double): String {
-        val s = if (scale == scale.toLong().toDouble())
-            scale.toLong().toString() else scale.toString()
+        val s = if (scale == scale.toLong().toDouble()) scale.toLong().toString() else scale.toString()
         return "$s×"
     }
 
-    // --------------------------------------------------------------- live dot
+    // ------------------------------------------------------------------ misc
 
-    private fun startPulse() {
-        if (dotPulse?.isRunning == true) return
-        b.dot.alpha = 1f
-        dotPulse = ObjectAnimator.ofFloat(b.dot, "alpha", 1f, 0.25f).apply {
-            duration = 850
-            repeatCount = ObjectAnimator.INFINITE
-            repeatMode = ObjectAnimator.REVERSE
-            start()
-        }
+    private fun dp(v: Float) = v * resources.displayMetrics.density
+
+    private fun centerOf(v: View): Pair<Float, Float> {
+        val loc = IntArray(2); v.getLocationInWindow(loc)
+        val root = IntArray(2); b.root.getLocationInWindow(root)
+        return (loc[0] - root[0] + v.width / 2f) to (loc[1] - root[1] + v.height / 2f)
     }
-
-    private fun stopPulse() {
-        dotPulse?.cancel()
-        dotPulse = null
-        b.dot.alpha = 1f
-    }
-
-    // ------------------------------------------------------------------- misc
 
     private fun hideKeyboard() {
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.hideSoftInputFromWindow(b.host.windowToken, 0)
+        imm.hideSoftInputFromWindow(b.root.windowToken, 0)
+    }
+
+    private fun enterImmersive() {
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+
+    private fun showSystemBars() {
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            show(WindowInsetsCompat.Type.systemBars())
+            // dark icons on the light theme, light icons on the dark one
+            val night = (resources.configuration.uiMode and
+                Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+            isAppearanceLightStatusBars = !night
+            isAppearanceLightNavigationBars = !night
+        }
+    }
+
+    @SuppressLint("WifiManagerLeak")
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        @Suppress("DEPRECATION")
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        wifiLock = wm.createWifiLock(mode, "asext:stream").apply {
+            setReferenceCounted(false)
+            try { acquire() } catch (_: Exception) {}
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try { wifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
     }
 
     // --- SurfaceHolder.Callback ---
@@ -340,26 +558,26 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, StreamSession.
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         surfaceReady = false
-        session?.stop()
+        // The decoder must let go of the Surface before this returns. Null the
+        // field first so the session's own onStopped is recognised as stale.
+        val s = session
         session = null
-    }
-
-    private fun enterImmersive() {
-        window.decorView.systemUiVisibility = (
-            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                or View.SYSTEM_UI_FLAG_FULLSCREEN
-                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-            )
+        s?.stopAndJoin()
+        if (wantConnected && everStreamed) setState(State.RECONNECTING)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         wantConnected = false
         ui.removeCallbacksAndMessages(null)
-        stopPulse()
         session?.stop()
+        releaseWifiLock()
+    }
+
+    companion object {
+        private const val TAG = "MainActivity"
+        private const val MIN_RIPPLE_MS = 550L
+        private val BACKOFF_MS = longArrayOf(300, 800, 1500, 2500, 3000)
+        private val EMPHASIZED = PathInterpolator(0.2f, 0f, 0f, 1f)
     }
 }

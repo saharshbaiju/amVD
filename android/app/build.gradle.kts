@@ -11,13 +11,34 @@ android {
         applicationId = "com.archextender"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1-base"
+        versionCode = 3
+        versionName = "0.3.0"
+    }
+
+    // Release signing. The keystore lives OUTSIDE the repo; point at it with
+    // env vars or ~/.gradle/gradle.properties (see docs/RELEASING.md):
+    //   ASEXT_KEYSTORE, ASEXT_KEYSTORE_PASSWORD, ASEXT_KEY_ALIAS, ASEXT_KEY_PASSWORD
+    // Without them, release builds fall back to the debug key (local testing only).
+    fun secret(name: String): String? =
+        System.getenv(name) ?: (project.findProperty(name) as String?)
+    val releaseKeystore = secret("ASEXT_KEYSTORE")?.let { file(it) }?.takeIf { it.exists() }
+
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = releaseKeystore
+                storePassword = secret("ASEXT_KEYSTORE_PASSWORD")
+                keyAlias = secret("ASEXT_KEY_ALIAS") ?: "asext"
+                keyPassword = secret("ASEXT_KEY_PASSWORD") ?: secret("ASEXT_KEYSTORE_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = if (releaseKeystore != null) signingConfigs.getByName("release")
+                            else signingConfigs.getByName("debug")
         }
     }
 
@@ -36,4 +57,10 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.activity:activity-ktx:1.9.3")
+    // Material 3 (Material You): dynamic color, cards, buttons, text fields.
+    implementation("com.google.android.material:material:1.12.0")
+    // Google code scanner: Play-services hosted QR scanner UI, no camera
+    // permission needed in this app.
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
 }

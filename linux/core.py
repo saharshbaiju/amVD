@@ -1,44 +1,40 @@
 """
-core.py - shared config, detection and dependency logic for Arch Screen Extender.
+core.py - shared config, detection and dependency logic for Screen Extender.
 
 Used by the TUI (tui.py). The streaming engine (extenderd.py) stays a standalone
 CLI that the TUI launches with explicit flags built from a Config here.
+
+Supported desktops (see backends/):
+    Arch      + Hyprland          -> hyprland backend
+    Ubuntu    + GNOME (Wayland)   -> gnome backend
+    Fedora    + GNOME (Wayland)   -> gnome backend
 """
 
 import glob
+import importlib.util
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
+import time
 from dataclasses import asdict, dataclass
+from urllib.parse import quote
+
+import backends
+from backends import gnome as gnome_backend
+from backends import hyprland as hypr_backend
 
 CONFIG_DIR = os.path.expanduser("~/.config/archscreenextender")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
-# Quality preset -> CBR bitrate handed to the VA-API encoder.
+# Quality preset -> CBR bitrate handed to the encoder.
 QUALITY = {"low": "4M", "medium": "8M", "high": "12M", "ultra": "20M"}
-
-# User-facing "side" -> Hyprland auto-placement keyword.
-SIDES = {
-    "right": "auto-right",
-    "left": "auto-left",
-    "up": "auto-up",
-    "down": "auto-down",
-}
-
-# (binary, pacman package, purpose, required?)
-DEPS = [
-    ("hyprctl", "hyprland", "Wayland compositor (must already be running)", True),
-    ("wf-recorder", "wf-recorder", "headless capture + VA-API H.264 encode", True),
-    ("vainfo", "libva-utils", "VA-API capability detection (optional)", False),
-    ("adb", "android-tools", "USB phone size auto-match (optional, needs USB debugging)", False),
-]
 
 # Android USB tethering (RNDIS/NCM) is the wired transport: it needs NO USB
 # debugging. The phone becomes a USB network gadget, runs a DHCP server, and
-# hands the PC an address on this subnet (phone = gateway, .129 by default).
-# The phone then reaches the daemon at the PC's address on that link.
+# hands the PC an address on this subnet.
 USB_TETHER_PREFIX = "192.168.42."
 
 RES_PRESETS = [
@@ -52,33 +48,30 @@ RES_PRESETS = [
 
 @dataclass
 class Config:
+    backend: str = "auto"          # auto / hyprland / gnome
     output: str = "EXT-1"
     side: str = "right"            # right / left / up / down
     width: int = 1920
     height: int = 1080
     fps: int = 60
-    scale: float = 1.0             # Hyprland scale for the virtual monitor
+    scale: float = 1.0             # desktop scale of the virtual monitor
     quality: str = "high"          # low / medium / high / ultra
-    codec: str = "h264"            # h264 / hevc
+    codec: str = "h264"            # the app decodes h264
     gop: int = 30                  # keyframe interval (frames)
-    transport: str = "usb"         # usb / wifi
+    transport: str = "usb"         # usb / wifi (preferred address in the QR)
     port: int = 5000
     va_device: str = "/dev/dri/renderD128"
 
     def bitrate(self) -> str:
         return QUALITY.get(self.quality, "12M")
 
-    def position(self) -> str:
-        return SIDES.get(self.side, "auto-right")
+    def resolved_backend(self):
+        return backends.detect() if self.backend == "auto" else self.backend
 
-    def extenderd_args(self, position: str = None) -> list:
-        """Build the explicit CLI for extenderd.py from this config.
-
-        `position` overrides the placement passed to the daemon (e.g. an
-        explicit "XxY" computed from the live monitor layout). Falls back to
-        the Hyprland auto-* keyword for this side.
-        """
+    def extenderd_args(self) -> list:
+        """Build the explicit CLI for extenderd.py from this config."""
         return [
+            "--backend", self.resolved_backend() or "auto",
             "--output", self.output,
             "--width", str(self.width),
             "--height", str(self.height),
@@ -86,11 +79,10 @@ class Config:
             "--scale", str(self.scale),
             "--bitrate", self.bitrate(),
             "--codec", self.codec,
-            "--position", position or self.position(),
+            "--side", self.side,
             "--gop", str(self.gop),
             "--device", self.va_device,
             "--port", str(self.port),
-            "--side", self.side,
             "--quality", self.quality,
         ]
 
@@ -118,7 +110,8 @@ def save_config(cfg: Config) -> None:
 
 
 # Settings advertised to the phone. Keys must match build_banner_payload() in
-# extenderd.py so the daemon can frame this JSON verbatim.
+# extenderd.py; the daemon also reads side/scale from here on SIGHUP and moves
+# the monitor live.
 BANNER_PATH = os.path.join(CONFIG_DIR, "daemon-banner.json")
 
 
@@ -133,118 +126,163 @@ def banner_payload(cfg: Config) -> dict:
         "bitrate": cfg.bitrate(),
         "codec": cfg.codec,
         "gop": cfg.gop,
+        "host": socket.gethostname(),
+        "backend": cfg.resolved_backend() or "",
     }
 
 
 def write_banner_file(cfg: Config, path: str = BANNER_PATH) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(banner_payload(cfg), f)
+    os.replace(tmp, path)          # atomic: the daemon never reads half a file
+
+
+# --------------------------------------------------------------------------- #
+# Distro + dependencies
+# --------------------------------------------------------------------------- #
+
+def distro() -> str:
+    """'arch' / 'debian' (Ubuntu, Mint, Pop…) / 'fedora' / 'unknown'."""
+    ids = ""
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith(("ID=", "ID_LIKE=")):
+                    ids += " " + line.split("=", 1)[1].strip().strip('"').lower()
+    except OSError:
+        pass
+    for key, name in (("arch", "arch"), ("fedora", "fedora"), ("rhel", "fedora"),
+                      ("ubuntu", "debian"), ("debian", "debian")):
+        if key in ids.split():
+            return name
+    return "unknown"
+
+
+INSTALL_CMD = {
+    "arch": ["sudo", "pacman", "-S", "--needed"],
+    "debian": ["sudo", "apt", "install", "-y"],
+    "fedora": ["sudo", "dnf", "install", "-y"],
+}
+
+
+def _bin(name):
+    return lambda: shutil.which(name) is not None
+
+
+def _gst(element):
+    return lambda: bool(shutil.which("gst-inspect-1.0")
+                        and gnome_backend.gst_inspect(element))
+
+
+def _any_h264_encoder():
+    return bool(shutil.which("gst-inspect-1.0") and gnome_backend.pick_encoder())
+
+
+# (label, check, {distro: package}, required, purpose)
+DEPS = {
+    "hyprland": [
+        ("hyprctl", _bin("hyprctl"), {"arch": "hyprland"}, True,
+         "Hyprland compositor (must be running)"),
+        ("wf-recorder", _bin("wf-recorder"),
+         {"arch": "wf-recorder", "debian": "wf-recorder", "fedora": "wf-recorder"},
+         True, "headless capture + VA-API H.264 encode"),
+        ("vainfo", _bin("vainfo"),
+         {"arch": "libva-utils", "debian": "vainfo", "fedora": "libva-utils"},
+         False, "VA-API capability detection"),
+    ],
+    "gnome": [
+        ("gst-launch-1.0", _bin("gst-launch-1.0"),
+         {"arch": "gstreamer", "debian": "gstreamer1.0-tools",
+          "fedora": "gstreamer1"}, True, "runs the capture/encode pipeline"),
+        ("python gi", lambda: importlib.util.find_spec("gi") is not None,
+         {"arch": "python-gobject", "debian": "python3-gi",
+          "fedora": "python3-gobject"}, True, "talks to Mutter over D-Bus"),
+        ("pipewiresrc", _gst("pipewiresrc"),
+         {"arch": "gst-plugin-pipewire", "debian": "gstreamer1.0-pipewire",
+          "fedora": "pipewire-gstreamer"}, True, "reads the virtual monitor"),
+        ("videoconvert", _gst("videoconvert"),
+         {"arch": "gst-plugins-base", "debian": "gstreamer1.0-plugins-base",
+          "fedora": "gstreamer1-plugins-base"}, True, "pixel format conversion"),
+        ("h264parse", _gst("h264parse"),
+         {"arch": "gst-plugins-bad", "debian": "gstreamer1.0-plugins-bad",
+          "fedora": "gstreamer1-plugins-bad-free"}, True,
+         "H.264 framing (+ VA-API encoders)"),
+        ("H.264 encoder", _any_h264_encoder,
+         {"arch": "gst-plugins-ugly", "debian": "gstreamer1.0-plugins-ugly",
+          "fedora": "gstreamer1-plugin-openh264"}, True,
+         "x264 / openh264 (VA-API used automatically if present)"),
+    ],
+    "common": [
+        ("adb", _bin("adb"),
+         {"arch": "android-tools", "debian": "adb", "fedora": "android-tools"},
+         False, "phone size auto-match (needs USB debugging)"),
+    ],
+}
+
+
+def check_dependencies(backend=None) -> list:
+    """[(label, package, purpose, required, present), ...] for this backend."""
+    d = distro()
+    rows = []
+    for label, check, pkgs, req, purpose in (DEPS.get(backend, [])
+                                             + DEPS["common"]):
+        try:
+            present = bool(check())
+        except Exception:
+            present = False
+        rows.append((label, pkgs.get(d, next(iter(pkgs.values()))), purpose,
+                     req, present))
+    return rows
+
+
+def missing_packages(backend=None, required_only=False) -> list:
+    pkgs = []
+    for _l, pkg, _p, req, present in check_dependencies(backend):
+        if not present and (req or not required_only) and pkg not in pkgs:
+            pkgs.append(pkg)
+    return pkgs
+
+
+def install_command(packages) -> list:
+    base = INSTALL_CMD.get(distro())
+    return base + packages if base else None
 
 
 # --------------------------------------------------------------------------- #
 # Detection
 # --------------------------------------------------------------------------- #
 
-def detect_monitors() -> list:
-    try:
-        out = subprocess.run(["hyprctl", "monitors", "-j"],
-                             capture_output=True, text=True, timeout=5).stdout
-        return json.loads(out)
-    except Exception:
-        return []
-
-
-def primary_monitor():
-    mons = [m for m in detect_monitors() if not m.get("name", "").startswith("EXT-")]
-    for m in mons:
-        if m.get("focused"):
-            return m
-    return mons[0] if mons else None
-
-
-def _hyprctl(*args):
-    return subprocess.run(["hyprctl", *args], capture_output=True,
-                          text=True, timeout=5)
-
-
-def compute_position(cfg) -> str:
-    """Explicit "XxY" Hyprland placement for the virtual output.
-
-    Hyprland's auto-left/right/up/down keywords are unreliable across versions,
-    so we place the secondary monitor at concrete logical coordinates relative
-    to the focused/primary monitor. Falls back to the auto-* keyword if we
-    can't read the layout. Coordinates are in logical pixels (mode / scale).
-    """
-    primary = primary_monitor()
-    if not primary:
-        return cfg.position()
-    try:
-        pscale = primary.get("scale", 1) or 1
-        px = int(primary.get("x", 0))
-        py = int(primary.get("y", 0))
-        pw = int(primary["width"] / pscale)   # primary logical size
-        ph = int(primary["height"] / pscale)
-        cscale = cfg.scale or 1
-        ew = int(cfg.width / cscale)           # extender logical size
-        eh = int(cfg.height / cscale)
-    except Exception:
-        return cfg.position()
-
-    if cfg.side == "left":
-        x, y = px - ew, py
-    elif cfg.side == "up":
-        x, y = px, py - eh
-    elif cfg.side == "down":
-        x, y = px, py + ph
-    else:  # right (default)
-        x, y = px + pw, py
-    return f"{x}x{y}"
-
-
-def apply_live_monitor(cfg) -> bool:
-    """Re-apply the virtual monitor's mode/position/scale to a running output.
-
-    Used for realtime config changes (side, scale) that don't require
-    restarting the capture/encode pipeline. Returns True on success.
-    """
-    pos = compute_position(cfg)
-    rule = f"{cfg.output},{cfg.width}x{cfg.height}@{cfg.fps},{pos},{cfg.scale}"
-    try:
-        return _hyprctl("keyword", "monitor", rule).returncode == 0
-    except Exception:
-        return False
-
-
-def remove_virtual_output(name: str) -> None:
-    """Move windows off the virtual output and remove it (restore windows).
-
-    Mirrors the daemon's own cleanup so the TUI can tear the monitor down when
-    the daemon was launched with --keep-output (so it survives restarts).
-    """
-    try:
-        mons = detect_monitors()
-    except Exception:
-        mons = []
-    if not any(m.get("name") == name for m in mons):
-        return  # already gone
-
-    primary = (next((m for m in mons
-                     if m.get("name") != name and m.get("focused")), None)
-               or next((m for m in mons if m.get("name") != name), None))
-    if primary:
+def primary_monitor_desc(backend) -> str:
+    """One-line description of the main display, for the hardware screen."""
+    if backend == "hyprland":
+        m = hypr_backend.primary_for("EXT-1")
+        if m:
+            return (f"{m['name']}  {m['width']}x{m['height']}"
+                    f"@{m.get('refreshRate', 0):.0f}  scale {m.get('scale', 1)}")
+    elif backend == "gnome":
         try:
-            workspaces = json.loads(_hyprctl("workspaces", "-j").stdout)
-            for w in workspaces:
-                if w.get("monitor") == name:
-                    _hyprctl("dispatch", "moveworkspacetomonitor",
-                             f"{w['id']} {primary['name']}")
+            from gi.repository import Gio
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            _s, _mons, logicals, _p = gnome_backend.display_state(bus)
+            for x, y, sc, _t, primary, specs, _lp in logicals:
+                if primary:
+                    return f"{specs[0][0]}  at {x},{y}  scale {sc:g}"
         except Exception:
             pass
-    try:
-        _hyprctl("output", "remove", name)
-    except Exception:
-        pass
+    return "(none found)"
+
+
+def remove_virtual_output(cfg: Config) -> None:
+    """Hyprland: move windows off EXT and remove it (the TUI launches the daemon
+    with --keep-output so the monitor survives restarts). GNOME's virtual
+    monitor disappears by itself when the daemon stops."""
+    if cfg.resolved_backend() == "hyprland":
+        try:
+            hypr_backend.remove_output(cfg.output)
+        except Exception:
+            pass
 
 
 def detect_va_device() -> str:
@@ -268,15 +306,46 @@ def adb_device_present() -> bool:
     try:
         r = subprocess.run(["adb", "devices"], capture_output=True,
                            text=True, timeout=5)
-        rows = [l for l in r.stdout.splitlines()[1:]
-                if l.strip() and l.strip().endswith("device")]
-        return len(rows) > 0
+        return any(l.strip().endswith("device")
+                   for l in r.stdout.splitlines()[1:])
     except Exception:
         return False
 
 
+_adb_reverse_cache = {}
+
+
+def adb_reverse(port: int) -> bool:
+    """Forward the phone's 127.0.0.1:port to ours over the USB cable via adb.
+
+    Works whenever the phone is plugged in with USB debugging on, even when it
+    is on mobile data and can't see the PC on Wi-Fi. Re-run at most every 10 s
+    (it's cheap, but the TUI asks often); True if at least one phone has it.
+    """
+    now = time.time()
+    hit = _adb_reverse_cache.get(port)
+    if hit and now - hit[0] < 10:
+        return hit[1]
+    ok = False
+    if shutil.which("adb"):
+        try:
+            r = subprocess.run(["adb", "devices"], capture_output=True,
+                               text=True, timeout=5)
+            serials = [l.split()[0] for l in r.stdout.splitlines()[1:]
+                       if l.strip().endswith("device")]
+            for sn in serials:
+                rr = subprocess.run(["adb", "-s", sn, "reverse",
+                                     f"tcp:{port}", f"tcp:{port}"],
+                                    capture_output=True, timeout=5)
+                ok = ok or rr.returncode == 0
+        except Exception:
+            ok = False
+    _adb_reverse_cache[port] = (now, ok)
+    return ok
+
+
 def detect_phone_size(landscape: bool = True):
-    """(w, h) of a USB phone's panel, oriented for the (landscape) app. None if absent."""
+    """(w, h) of a USB phone's panel, oriented for the (landscape) app."""
     if not adb_device_present():
         return None
     try:
@@ -292,6 +361,32 @@ def detect_phone_size(landscape: bool = True):
         return None
 
 
+# Interfaces that are never a path to the phone (containers, VMs, VPN tunnels).
+_VIRTUAL_IF = re.compile(r"^(docker|br-|veth|virbr|vboxnet|vmnet|tun|tap|wg|"
+                         r"lxc|lxd|podman|cni|flannel|zt)")
+
+
+def _ip_addrs():
+    """[(ifname, ipv4), ...] for every up, non-loopback, non-virtual interface."""
+    try:
+        out = subprocess.run(["ip", "-j", "addr"], capture_output=True,
+                             text=True, timeout=5).stdout
+        links = json.loads(out)
+    except Exception:
+        return []
+    res = []
+    for link in links:
+        name = link.get("ifname", "")
+        if name == "lo" or _VIRTUAL_IF.match(name):
+            continue
+        if "UP" not in link.get("flags", []):
+            continue
+        for a in link.get("addr_info", []):
+            if a.get("family") == "inet" and a.get("local"):
+                res.append((name, a["local"]))
+    return res
+
+
 def lan_ip():
     try:
         r = subprocess.run(["ip", "route", "get", "1.1.1.1"],
@@ -302,50 +397,41 @@ def lan_ip():
         return None
 
 
-def _ip_addrs():
-    """[(ifname, ipv4), ...] for every up, non-loopback interface."""
-    try:
-        out = subprocess.run(["ip", "-j", "addr"], capture_output=True,
-                             text=True, timeout=5).stdout
-        links = json.loads(out)
-    except Exception:
-        return []
-    res = []
-    for link in links:
-        name = link.get("ifname", "")
-        if name == "lo":
-            continue
-        for a in link.get("addr_info", []):
-            if a.get("family") == "inet" and a.get("local"):
-                res.append((name, a["local"]))
-    return res
-
-
 def usb_tether_ip():
     """This PC's IPv4 on the USB-tether link, or None if no phone is tethered.
 
-    USB tethering needs no USB debugging: the phone is a USB network gadget that
-    assigns the PC an address on Android's default 192.168.42.0/24 subnet, and
-    the phone reaches the daemon at the PC's address on that link. We prefer an
-    address on that subnet; failing that (vendor with a non-standard subnet) we
-    fall back to a USB-gadget-looking interface (usb0, enp0s20f0u1, rndis…).
+    Prefers Android's default 192.168.42.0/24 subnet; failing that (vendor with
+    a non-standard subnet) a USB-gadget-looking interface (usb0, enp0s20f0u1…).
     """
     addrs = _ip_addrs()
     for _name, ip in addrs:
         if ip.startswith(USB_TETHER_PREFIX):
             return ip
     for name, ip in addrs:
-        if (name.startswith(("usb", "rndis", "ncm")) or re.search(r"u\d", name)):
+        if name.startswith(("usb", "rndis", "ncm")) or re.search(r"u\d", name):
             return ip
     return None
 
 
-def check_dependencies() -> list:
-    """[(binary, package, purpose, required, present), ...]"""
-    return [(b, p, purpose, req, shutil.which(b) is not None)
-            for (b, p, purpose, req) in DEPS]
+def candidate_ips(cfg: Config) -> list:
+    """Every address the phone might reach us on, preferred transport first."""
+    tether, lan = usb_tether_ip(), lan_ip()
+    adb = "127.0.0.1" if adb_reverse(cfg.port) else None
+    first = ([adb, tether, lan] if cfg.transport == "usb"
+             else [lan, tether, adb])
+    ips = []
+    for ip in first + [ip for _n, ip in _ip_addrs()]:
+        if ip and ip not in ips:
+            ips.append(ip)
+    return ips[:5]
 
 
-def missing_packages() -> list:
-    return [p for (_b, p, _purpose, _req, present) in check_dependencies()
-            if not present]
+def connect_uri(cfg: Config) -> str:
+    """What the pairing QR encodes. The app tries every host in parallel and
+    keeps the first that answers, so USB and Wi-Fi both just work:
+
+        asext://c?h=192.168.42.129,10.0.0.5&p=5000&n=archbox&v=1
+    """
+    hosts = ",".join(candidate_ips(cfg)) or "0.0.0.0"
+    name = quote(socket.gethostname()[:24], safe="")
+    return f"asext://c?h={hosts}&p={cfg.port}&n={name}&v=1"
