@@ -337,6 +337,106 @@ def adb_device_present() -> bool:
         return False
 
 
+def adb_status() -> str:
+    """'missing' (no adb), 'none' (nothing plugged in / debugging off),
+    'unauthorized' (phone hasn't accepted this PC's key yet) or 'ok'."""
+    if not shutil.which("adb"):
+        return "missing"
+    try:
+        r = subprocess.run(["adb", "devices"], capture_output=True,
+                           text=True, timeout=5)
+    except Exception:
+        return "none"
+    states = [l.split()[-1] for l in r.stdout.splitlines()[1:] if l.strip()]
+    if "device" in states:
+        return "ok"
+    return "unauthorized" if "unauthorized" in states else "none"
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _active(unit):
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", unit],
+                              timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
+def _port_in_ranges(port, items):
+    """True if `port`/tcp is covered by firewalld-style '5000/tcp' or
+    '1025-65535/tcp' entries."""
+    for it in items:
+        rng, _, proto = it.partition("/")
+        if proto and proto != "tcp":
+            continue
+        lo, _, hi = rng.partition("-")
+        try:
+            if int(lo) <= port <= int(hi or lo):
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def firewall_check(port: int):
+    """A host firewall that may stop the phone reaching `port` over Wi-Fi /
+    USB tethering, or None. Works without root (reads configs, asks
+    firewalld over D-Bus). Returns {"name", "blocked": True|None (unknown),
+    "fix": argv to open the port (run with sudo)}. adb (127.0.0.1) is never
+    affected: firewalls accept loopback."""
+    conf = _read("/etc/ufw/ufw.conf") or ""
+    if re.search(r"^\s*ENABLED\s*=\s*yes", conf, re.M):
+        rules = _read("/etc/ufw/user.rules")
+        if rules is not None and re.search(rf"--dport {port}\b.*ACCEPT", rules):
+            return None
+        return {"name": "ufw", "blocked": True if rules is not None else None,
+                "fix": ["sudo", "ufw", "allow", f"{port}/tcp"]}
+    if shutil.which("firewall-cmd"):
+        try:
+            st = subprocess.run(["firewall-cmd", "--state"], capture_output=True,
+                                text=True, timeout=5).stdout.strip()
+        except Exception:
+            st = ""
+        if st == "running":
+            fix = ["sudo", "sh", "-c",
+                   f"firewall-cmd --add-port={port}/tcp && "
+                   f"firewall-cmd --permanent --add-port={port}/tcp"]
+            try:
+                r = subprocess.run(["firewall-cmd", "--list-ports"],
+                                   capture_output=True, text=True, timeout=5)
+            except Exception:
+                r = None
+            if r is None or r.returncode != 0:
+                return {"name": "firewalld", "blocked": None, "fix": fix}
+            if _port_in_ranges(port, r.stdout.split()):
+                return None     # e.g. Fedora Workstation opens 1025-65535
+            return {"name": "firewalld", "blocked": True, "fix": fix}
+    rule = f"tcp dport {port} accept"
+    if _active("nftables"):
+        conf = _read("/etc/nftables.conf") or ""
+        if "policy drop" in conf and not re.search(rf"dport\s+{{?[^}}]*\b{port}\b", conf):
+            return {"name": "nftables", "blocked": True,
+                    "fix": ["sudo", "nft", "insert", "rule", "inet", "filter",
+                            "input"] + rule.split()}
+    for unit, path in (("iptables", "/etc/iptables/iptables.rules"),
+                       ("netfilter-persistent", "/etc/iptables/rules.v4")):
+        if _active(unit):
+            conf = _read(path) or ""
+            if re.search(r":INPUT (DROP|REJECT)|-P INPUT (DROP|REJECT)", conf) \
+                    and f"--dport {port}" not in conf:
+                return {"name": "iptables", "blocked": True,
+                        "fix": ["sudo", "iptables", "-I", "INPUT", "-p", "tcp",
+                                "--dport", str(port), "-j", "ACCEPT"]}
+    return None
+
+
 _adb_reverse_cache = {}
 
 

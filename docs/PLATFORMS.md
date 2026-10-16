@@ -136,7 +136,7 @@ includes that address.
 | Symptom | Check |
 | --- | --- |
 | Phone: *"reachable, but the extender isn't running"* | Start it in the TUI (`amvd` → Start extender); check the daemon log in the live view |
-| Phone: *"Couldn't reach …"* | Phone on mobile data / another network? Plug in the cable (adb, see above) and rescan, or USB tethering on? Same Wi-Fi? Firewall: `sudo ufw allow 5000/tcp` (Ubuntu) or `sudo firewall-cmd --add-port=5000/tcp` (Fedora) |
+| Phone: *"Couldn't reach …"* | The live view's **connection checks** say why. *Firewall … press f*: opens TCP 5000 (ufw / firewalld / nftables / iptables are detected without root — note Arch's stock `/etc/nftables.conf` drops everything but SSH once `nftables.service` is enabled; `f` adds a runtime rule, add `tcp dport 5000 accept` to the file to keep it). *USB cable*: needs adb installed, USB debugging on, and "Allow USB debugging" accepted on the phone — then rescan the QR. Same Wi-Fi but still unreachable: guest/campus/hotel Wi-Fi isolates clients — use the cable or the phone's hotspot |
 | Phone: *"Connected, but no video arrived"* | Encoder failed — the live view's daemon log shows `gst:` / wf-recorder errors; `python3 extenderd.py … </dev/null` prints everything |
 | TUI: *"GNOME is running on X11"* | Log in to the Wayland session |
 | GNOME: `could not create the virtual monitor` | GNOME < 40, or Mutter's ScreenCast interface not available (`gdbus introspect --session -d org.gnome.Mutter.ScreenCast -o /org/gnome/Mutter/ScreenCast`) |

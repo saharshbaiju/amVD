@@ -59,8 +59,12 @@ phone, open it, and allow "install unknown apps" for your browser when asked.
      on mobile data.
    - **USB tethering**: *Settings → Hotspot & tethering → USB tethering* (no
      developer options needed).
-   - **Wi-Fi**: phone and computer on the same network (allow port 5000 in the
-     firewall: `sudo ufw allow 5000/tcp` on Ubuntu).
+   - **Wi-Fi**: phone and computer on the same network. If a firewall is in
+     the way, the live view says so — press **f** to open port 5000.
+
+   While it waits for the phone, the live view shows **connection checks**
+   (USB debugging authorised? firewall? Wi-Fi) explaining why a phone can't
+   connect yet.
 3. In the app tap **Scan QR code**, scan the terminal, tap **Connect**. Ripples
    spread from your finger, then the screen dissolves into your extended desktop.
 

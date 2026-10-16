@@ -73,13 +73,15 @@ def run_shell(win, cmd, prompt="press Enter to return"):
     curses.def_prog_mode()
     curses.endwin()
     print("\n$ " + " ".join(cmd) + "\n", flush=True)
+    rc = 1
     try:
-        subprocess.run(cmd)
+        rc = subprocess.run(cmd).returncode
     except Exception as e:
         print(f"error: {e}")
     input(f"\n{prompt} ")
     curses.reset_prog_mode()
     win.refresh()
+    return rc
 
 
 # --------------------------------------------------------------------------- #
@@ -341,6 +343,16 @@ def hardware_screen(win, cfg):
         rows.append((f"USB (adb)       : phone plugged in — adb reverse "
                      f"tcp:{cfg.port} active, 127.0.0.1 is in the QR",
                      curses.color_pair(3)))
+    else:
+        text, color = ADB_HINT[core.adb_status()]
+        rows.append(("USB (adb)       :" + text.split(":", 1)[1],
+                     curses.color_pair(color)))
+    fw = core.firewall_check(cfg.port)
+    rows.append((f"Firewall        : {fw['name']} "
+                 f"{'blocks' if fw['blocked'] else 'may block'} port "
+                 f"{cfg.port} — fix: {' '.join(fw['fix'])}"
+                 if fw else "Firewall        : nothing blocking "
+                 f"port {cfg.port}", curses.color_pair(4 if fw else 3)))
     if tether_ip:
         rows.append((f"USB tethering   : up — {tether_ip} "
                      "(no USB debugging needed)", curses.color_pair(3)))
@@ -530,6 +542,33 @@ def draw_qr(win, y, x, lines):
             pass
 
 
+# Kept under ~56 columns: the live view's text column stops at the QR code.
+ADB_HINT = {
+    "ok": ("USB cable : ready (127.0.0.1 is in the QR)", 3),
+    "unauthorized": ("USB cable : tap 'Allow USB debugging' on the phone", 4),
+    "none": ("USB cable : none (needs USB debugging on the phone)", 5),
+    "missing": ("USB cable : install adb (android-tools) to use it", 5),
+}
+
+
+def draw_checks(win, y, width, fw, adb):
+    """Why a phone might not reach us yet. Returns the next free row."""
+    addstr(win, y, 2, "connection checks:", curses.color_pair(5))
+    text, color = ADB_HINT[adb]
+    addstr(win, y + 1, 4, text[:width], curses.color_pair(color))
+    if fw:
+        verb = "blocks" if fw["blocked"] else "may block"
+        addstr(win, y + 2, 4, f"Firewall  : {fw['name']} {verb} the phone — "
+                              "press f"[:width],
+               curses.color_pair(4) | curses.A_BOLD)
+    else:
+        addstr(win, y + 2, 4, "Firewall  : nothing blocking the port"[:width],
+               curses.color_pair(3))
+    addstr(win, y + 3, 4, "Wi-Fi     : same network? guest/campus Wi-Fi "
+                          "isolates"[:width], curses.color_pair(5))
+    return y + 4
+
+
 def live_screen(win, stream):
     """Live status + pairing QR for the already-running stream.
 
@@ -538,6 +577,7 @@ def live_screen(win, stream):
     """
     disconnect = False
     uri, ips, refreshed = "", [], 0.0
+    fw, adb, checked, fw_fixed = None, "none", 0.0, False
     win.nodelay(True)
     try:
         while True:
@@ -548,6 +588,10 @@ def live_screen(win, stream):
                 ips = core.candidate_ips(cfg)
                 uri = core.connect_uri(cfg)
                 refreshed = time.monotonic()
+            if time.monotonic() - checked > 5:
+                fw = None if fw_fixed else core.firewall_check(cfg.port)
+                adb = core.adb_status()
+                checked = time.monotonic()
             live = stream.state["live"]
             exited = not stream.running()
             header(win)
@@ -599,6 +643,8 @@ def live_screen(win, stream):
                 addstr(win, text_y + 1 + i, 4, f"{ip}:{cfg.port}   ({tag})",
                        curses.color_pair(1) | curses.A_BOLD)
             y = text_y + 2 + max(1, len(ips))
+            if not live and not exited:
+                y = draw_checks(win, y, left_w, fw, adb) + 1
 
             if exited and stream.error:
                 addstr(win, y, 2, f"error: {stream.error}", curses.color_pair(4))
@@ -610,14 +656,19 @@ def live_screen(win, stream):
                 draw_qr(win, qr_y, qr_x, qr_lines)   # last, so nothing overlaps it
 
             footer(win, "q/Esc back (keeps streaming)   d disconnect & remove "
-                        "monitor" + ("   — daemon stopped, any key" if exited
-                                     else ""))
+                        "monitor" + ("   f open firewall" if fw and not live
+                                     else "")
+                        + ("   — daemon stopped, any key" if exited else ""))
             win.refresh()
 
             c = win.getch()
             if c in (ord("d"), ord("D")):
                 disconnect = True
                 break
+            if c in (ord("f"), ord("F")) and fw:
+                if run_shell(win, fw["fix"]) == 0:
+                    fw_fixed, fw = True, None     # nft/iptables: not re-detectable
+                continue
             if c in (ord("q"), 27) or (exited and c != -1):
                 disconnect = disconnect or exited
                 break

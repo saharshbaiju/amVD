@@ -88,11 +88,26 @@ case "$backend" in
             warn "On Ubuntu, pick \"Ubuntu\" (not \"Ubuntu on Xorg\") on the login screen.";;
 esac
 
-# ---- 4. firewall hint (Wi-Fi connections only; USB via adb doesn't need it)
-if command -v ufw >/dev/null && sudo -n ufw status 2>/dev/null | grep -q "Status: active"; then
-  warn "ufw is active: for Wi-Fi run  sudo ufw allow 5000/tcp"
-elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-  warn "firewalld is active: for Wi-Fi run  sudo firewall-cmd --add-port=5000/tcp --permanent && sudo firewall-cmd --reload"
+# ---- 4. firewall: the phone connects in on TCP 5000 over Wi-Fi / tethering
+#         (the USB-debugging path goes through adb on 127.0.0.1 and needs nothing)
+FW="$(python3 -c '
+import core
+f = core.firewall_check(core.Config().port)
+print((f["name"] + "|" + " ".join(f["fix"])) if f else "")')"
+if [[ -n "$FW" ]]; then
+  warn "${FW%%|*} may block the phone on Wi-Fi. To open the port:  ${FW#*|}"
+  if [[ -r /dev/tty ]]; then
+    read -r -p "Open it now? [Y/n] " ans </dev/tty || ans=n
+    if [[ ! "$ans" =~ ^[Nn] ]]; then
+      if python3 -c 'import core, subprocess, sys
+f = core.firewall_check(core.Config().port)
+sys.exit(subprocess.run(f["fix"]).returncode if f else 0)'; then
+        say "Port opened"
+      else
+        warn "Couldn't open the port"
+      fi
+    fi
+  fi
 fi
 
 # ---- 5. make `amvd` callable from any new terminal
