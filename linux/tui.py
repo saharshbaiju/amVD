@@ -68,6 +68,13 @@ def footer(win, text):
     addstr(win, h - 1, 0, " " + text, curses.color_pair(5))
 
 
+def show_busy(win, text):
+    """Draw a one-line 'working…' screen for a blocking step."""
+    header(win)
+    addstr(win, 3, 2, text, curses.color_pair(5) | curses.A_BOLD)
+    win.refresh()
+
+
 def run_shell(win, cmd, prompt="press Enter to return"):
     """Drop out of curses, run an interactive command, come back."""
     curses.def_prog_mode()
@@ -154,13 +161,18 @@ class Stream:
         self.stop.set()
 
     def _stop_daemon(self):
-        """Terminate the daemon; the virtual output stays (--keep-output)."""
+        """Terminate the daemon; the virtual output stays (--keep-output).
+
+        The daemon needs up to ~3.5 s (encoder stop + touch device teardown),
+        so the grace period is generous: SIGKILLing it early is what used to
+        leave capture running on a monitor that disconnect then removed.
+        """
         p = self.proc
         if p is None or p.poll() is not None:
             return
         try:
             p.terminate()
-            p.wait(timeout=4)
+            p.wait(timeout=8)
         except subprocess.TimeoutExpired:
             p.kill()
             try:
@@ -179,9 +191,18 @@ class Stream:
         self.touch_status = ""
         self.start()
 
-    def disconnect(self):
-        """Full teardown: stop the daemon and remove the virtual monitor."""
+    def disconnect(self, win=None):
+        """Full teardown: stop the daemon and remove the virtual monitor.
+
+        Strictly in that order — remove_virtual_output also makes sure no
+        capture is left on the monitor before Hyprland removes it. Takes a few
+        seconds, so `win` (if given) shows progress instead of a frozen UI.
+        """
+        if win is not None:
+            show_busy(win, "Disconnecting… stopping the stream")
         self._stop_daemon()
+        if win is not None:
+            show_busy(win, f"Disconnecting… removing {self.cfg.output}")
         core.remove_virtual_output(self.cfg)
 
     def push_banner(self):
@@ -597,6 +618,7 @@ def live_screen(win, stream):
     """
     disconnect = False
     uri, ips, refreshed = "", [], 0.0
+    qr_uri, qr_lines = None, []      # QR encoding is pure Python: redo on change
     fw, usb, checked, fw_fixed = None, ("…", "hint", None), 0.0, False
     touch_setup = None
     win.nodelay(True)
@@ -640,7 +662,9 @@ def live_screen(win, stream):
 
             # QR on the right when there's room, else below the text. Its width
             # depends on the payload (number of addresses, pairing key).
-            qr_lines = qr.render_halfblocks(qr.encode(uri, "M"), quiet=2)
+            if uri != qr_uri:
+                qr_lines = qr.render_halfblocks(qr.encode(uri, "M"), quiet=2)
+                qr_uri = uri
             qr_x = 64 if w > 64 + len(qr_lines[0]) else 2
             left_w = (qr_x - 4) if qr_x > 2 else w - 6   # keep text off the QR
             touch_text, touch_color = touch_line(cfg, stream, touch_setup)
@@ -714,7 +738,7 @@ def live_screen(win, stream):
     finally:
         win.nodelay(False)
         if disconnect:
-            stream.disconnect()
+            stream.disconnect(win)
 
 
 # --------------------------------------------------------------------------- #
@@ -737,7 +761,7 @@ def app(stdscr):
         choice = main_menu(stdscr, cfg, stream)
         if choice == "quit":
             if stream and stream.running():
-                stream.disconnect()
+                stream.disconnect(stdscr)
             break
         elif choice == "configure":
             running = stream is not None and stream.running()

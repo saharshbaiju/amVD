@@ -616,11 +616,14 @@ def main():
     threading.Thread(target=control_loop, daemon=True).start()
 
     def shutdown(*_):
+        """Signal handler: only flag the stop. The parser loop sees it within
+        0.5 s and the `finally` below stops capture — waiting for the encoder
+        here would stall the handler and push the TUI past its kill timeout,
+        leaving wf-recorder orphaned on an output that is about to vanish."""
         if stop_evt.is_set():
             return
         log("shutting down")
         stop_evt.set()
-        backend.stop_capture()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
@@ -630,6 +633,7 @@ def main():
         parse_annexb(stream, broadcaster, stop_evt)
     finally:
         shutdown()
+        backend.stop_capture()
         broadcaster.close_all()
         if touch_surface:
             touch_surface.close()

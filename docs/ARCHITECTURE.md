@@ -109,6 +109,18 @@ so it streams via NVENC. NVENC in CBR mode emits a filler NAL after almost every
 frame; the daemon drops filler, SEI and AUD NALs (`NAL_DROP`) before they reach
 the network.
 
+**Cost of NVIDIA rendering: capture is *not* zero-copy there.** wf-recorder only
+does DMA-BUF capture for VA-API, and only on the compositor's own GPU (with NVENC
+and `-d` it fails with `Unsupported format: bgra`; with VA-API on the iGPU it
+logs `compositor running on different device, disabling DMA-BUF`). So with
+Hyprland on NVIDIA every frame goes through `wl_shm` buffers
+(`/tmp/wf-recorder-shared-*`). Hyprland reads each frame back from the GPU on its
+single render thread. Measured at 2560x1440@120, that thread ran at **87 %** with
+capture running and **13 %** with wf-recorder paused. That leaves the main screen
+no headroom, so it drops frames, worse as the laptop heats up. The remedies are
+to render Hyprland on the iGPU (zero-copy VA-API again) or to stream at a lower
+fps/resolution, since the readback cost scales with pixels per second.
+
 ---
 
 ## 4. The pipeline, stage by stage
@@ -135,8 +147,17 @@ hyprctl eval 'hl.monitor({ output = "EXT-1", mode = "2400x1080@60", position = "
   teardown.
 - **Workspace split:** workspaces 1–10 are bound to the laptop, 11–20 to the
   phone — set *before* the output is created so EXT opens on 11.
-- On disconnect, EXT's workspaces are moved back to the primary before the
-  output is removed, so no window vanishes.
+- **Disconnect (`remove_output`) runs in a fixed order.** Each step closes a way
+  the compositor could freeze:
+  1. stop and *wait for* every wf-recorder still capturing EXT
+     (`kill_stale_capture`: SIGTERM, then SIGKILL after 2 s). A screencopy frame
+     still pending on a destroyed output can hang Hyprland;
+  2. focus the primary, because removing the focused monitor is a crash path;
+  3. move EXT's workspaces back to the primary, so no window vanishes;
+  4. `hyprctl output remove`, then hand the primary back to `auto`.
+- wf-recorder is spawned with `PR_SET_PDEATHSIG`, so it dies with the daemon
+  even when the daemon is SIGKILLed. Without that, an orphaned wf-recorder kept
+  capturing a monitor that the TUI was about to remove.
 
 ### Stage 0b — Virtual monitor, GNOME backend (`backends/gnome.py`)
 
@@ -449,7 +470,13 @@ tui.py ──spawns──▶ extenderd.py --keep-output --banner-file …
 ```
 
 - The TUI owns the daemon so it survives leaving the live view. `q` keeps
-  streaming; `d` disconnects and removes the monitor.
+  streaming; `d` disconnects and removes the monitor. The UI shows
+  "Disconnecting…" while it works, so the pause isn't mistaken for a hang.
+- **Shutdown never blocks in the signal handler.** SIGTERM only sets the stop
+  flag. The parser loop notices within 0.5 s, and the `finally` stops capture,
+  closes clients and removes the touch device. The TUI waits up to 8 s before
+  SIGKILL (it used to wait 4 s, which the daemon's own 3 s encoder wait could
+  overrun). Only after the daemon has exited is the monitor removed.
 - **Live edits:** `side`/`scale` are applied without restarting — the TUI rewrites
   `~/.config/archscreenextender/daemon-banner.json` (atomically) and sends
   `SIGHUP`; the daemon's control thread moves/rescales the monitor through the
@@ -477,6 +504,9 @@ causes; each is fixed and documented next to the code:
 | "Reconnecting…" forever with a wrong address | Any failure, even the very first, auto-retried | Auto-retry only after a stream has worked; first-time failures show a specific error |
 | Hyprland: capture dies at once (`Unsupported format: bgra`) | Encoder on a different GPU than the compositor (Hyprland on NVIDIA, VA-API on the iGPU with the NVDEC VA driver) | Encoder follows the compositor GPU: NVENC on NVIDIA, VA-API (with the right `LIBVA_DRIVER_NAME`) elsewhere |
 | Hyprland: *"invalid scale"* / *"EXT-1 overlaps"* popups | Requested scale gave fractional logical pixels; position computed from it. Also a restart overlapping the old daemon's teardown | Nearest valid scale; a new daemon waits for the old one to exit |
+| Hyprland: main screen drops frames while streaming, worse over time | Compositor on NVIDIA → wf-recorder captures through CPU `wl_shm` copies on Hyprland's render thread (87 % vs 13 % with capture paused) | Documented in §3. Render on the iGPU or lower fps/resolution |
+| Pressing `d` sometimes freezes the system | The TUI could SIGKILL the daemon before the daemon stopped wf-recorder. The orphaned capture stayed on EXT-1, and the output was removed under it, sometimes while it still had focus | Non-blocking signal handler, 8 s grace, `PR_SET_PDEATHSIG`, ordered `remove_output` (stop capture → focus primary → move workspaces → remove) |
+| Live view costs ~5 % CPU while idle | QR code re-encoded (pure Python) every 150 ms | Re-encoded only when the URI changes |
 | Resolution/scale/side ignored on Hyprland ≥ 0.55 | `hyprctl keyword`/`dispatch` broken by the Lua parser (fix existed but was left in a git stash) | `hyprctl eval` Lua API (restored and committed) |
 
 ---

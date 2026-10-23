@@ -195,12 +195,22 @@ def map_touch_device(device, output):
 
 
 def remove_output(name):
-    """Move windows off the virtual output back to the primary, then remove it."""
-    mons = monitors()
-    if not any(m.get("name") == name for m in mons):
+    """Safely take the virtual output away, in an order Hyprland tolerates.
+
+    1. stop anything still capturing it (a pending screencopy frame on a
+       destroyed output can freeze the compositor),
+    2. move focus / the cursor to the primary (removing the focused monitor is
+       a crash path),
+    3. move its workspaces (and windows) to the primary,
+    4. remove it and hand the primary back to auto placement.
+    """
+    kill_stale_capture(name)
+    if not any(m.get("name") == name for m in monitors()):
         return
     primary = primary_for(name)
     if primary:
+        hyprctl("eval", f'hl.dispatch(hl.dsp.focus({{ '
+                        f'monitor = "{primary["name"]}" }}))')
         try:
             for w in json.loads(hyprctl("workspaces", "-j").stdout):
                 if w.get("monitor") == name:
@@ -210,6 +220,7 @@ def remove_output(name):
                             f'monitor = "{primary["name"]}" }}))')
         except Exception as e:
             log(f"warning: could not reflow windows ({e})")
+        time.sleep(0.1)             # let the moves render before the removal
     hyprctl("output", "remove", name)
     restore_primary(name)
     log(f"removed headless output {name}")
@@ -337,8 +348,9 @@ def encoder_params(encoder, a):
                      f"maxrate={a.bitrate}", f"bufsize={a.bitrate}"]
 
 
-def kill_stale_capture(output):
-    """Kill an orphaned wf-recorder for our output (holds the GPU otherwise)."""
+def capture_pids(output):
+    """PIDs of every wf-recorder recording `output`."""
+    pids = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -349,11 +361,51 @@ def kill_stale_capture(output):
         except OSError:
             continue
         if args and args[0].endswith("wf-recorder") and output in args:
-            try:
-                os.kill(int(entry), signal.SIGTERM)
-                log(f"killed stale wf-recorder pid {entry}")
-            except OSError:
-                pass
+            pids.append(int(entry))
+    return pids
+
+
+def kill_stale_capture(output, grace=2.0):
+    """Stop any wf-recorder still recording `output` and wait until it is gone.
+
+    Waiting matters: removing a headless output while a client still has a
+    screencopy frame pending on it can freeze Hyprland (the "pressing d hangs
+    the system" bug). SIGTERM first, SIGKILL whatever outlives `grace`.
+    """
+    pids = capture_pids(output)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            log(f"stopping leftover wf-recorder pid {pid}")
+        except OSError:
+            pass
+    deadline = time.time() + grace
+    while pids and time.time() < deadline:
+        pids = [p for p in pids if os.path.exists(f"/proc/{p}")]
+        time.sleep(0.05)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            log(f"killed wf-recorder pid {pid} (ignored SIGTERM)")
+        except OSError:
+            pass
+
+
+PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent():
+    """preexec_fn: have the kernel SIGTERM wf-recorder when the daemon dies.
+
+    Without it a SIGKILLed daemon leaves wf-recorder orphaned, still capturing
+    the output the TUI is about to remove.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG,
+                                                 signal.SIGTERM)
+    except Exception:
+        pass
 
 
 class HyprlandBackend:
@@ -436,7 +488,8 @@ class HyprlandBackend:
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                      env={**os.environ, **env},
                                      stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, bufsize=0)
+                                     stderr=subprocess.PIPE, bufsize=0,
+                                     preexec_fn=_die_with_parent)
         threading.Thread(target=self._wf_log, args=(self.proc,),
                          daemon=True).start()
 
