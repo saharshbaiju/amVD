@@ -36,8 +36,12 @@ fine for local testing but must not be published.
 Debug builds use their own package id (`applicationIdSuffix ".debug"`) and the
 name *Screen Extender (debug)*, so a debug build and the release app install side
 by side and never replace each other. Only an *old* build of
-`com.archextender` signed with a different key (e.g. 0.2, built before the
-release key existed) must be uninstalled once before the first release APK.
+`com.archextender` signed with a different key must be uninstalled once before
+the release APK installs: any 0.2 build, and every debug / Android Studio build
+made before 0.4.0 (they had no `.debug` suffix, so they took the release
+package id with the debug key). On the phone that shows as *"App not
+installed — package conflicts with an existing package"*; via adb as
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Say so in the release notes.
 
 ## Cutting a release
 
@@ -45,7 +49,7 @@ release key existed) must be uninstalled once before the first release APK.
 2. Build and package:
 
    ```bash
-   V=0.4.0
+   V=0.4.1
    (cd android && JAVA_HOME=/opt/android-studio/jbr ./gradlew assembleRelease assembleDebug)
    mkdir -p dist
    cp android/app/build/outputs/apk/release/app-release.apk dist/amVD-$V.apk

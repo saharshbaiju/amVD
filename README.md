@@ -52,6 +52,13 @@ Download **`amVD-<version>.apk`** from the
 [latest release](https://github.com/saharshbaiju/amVD/releases/latest) on the
 phone, open it, and allow "install unknown apps" for your browser when asked.
 
+> **"App not installed" / "package conflicts with an existing package"?** The
+> phone still has an old *Screen Extender* that was signed with a different key
+> (a test build from before 0.4.0). Android never lets one key's app replace
+> another's, so uninstall *Screen Extender* once, then install the APK again.
+> Later updates install over it normally. (The `-debug.apk` is a separate app,
+> *Screen Extender (debug)*, which is why it installed when the normal one didn't.)
+
 ### Connect
 
 1. Run `amvd` → **Start extender**. A QR code appears.
