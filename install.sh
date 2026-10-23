@@ -28,8 +28,6 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-command -v python3 >/dev/null || { warn "python3 is required"; exit 1; }
-
 # ---- 1. get the files: a local checkout, else the latest release, else main
 SRC=""
 here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
@@ -70,11 +68,16 @@ EOF
 
 # ---- 3. system packages for this distro + desktop (same list the TUI checks)
 cd "$DEST/linux"
-read -r -a PKGS <<<"$(python3 -c 'import core; print(" ".join(core.missing_packages(core.Config().resolved_backend())))')"
+# Every check below must run under the interpreter `amvd` runs under (the
+# system one): asking a conda/pyenv python3 whether PyGObject is installed
+# gives the wrong answer for the program that will actually use it.
+source ./python.sh
+PY="$(amvd_python)" || { warn "python3 is required"; exit 1; }
+read -r -a PKGS <<<"$("$PY" -c 'import core; print(" ".join(core.missing_packages(core.Config().resolved_backend())))')"
 if (( ${#PKGS[@]} )); then
   say "Installing packages: ${PKGS[*]}"
   if command -v apt-get >/dev/null; then sudo apt-get update -qq || true; fi
-  CMD="$(python3 -c 'import core,sys; c=core.install_command(sys.argv[1:]); print(" ".join(c) if c else "")' "${PKGS[@]}")"
+  CMD="$("$PY" -c 'import core,sys; c=core.install_command(sys.argv[1:]); print(" ".join(c) if c else "")' "${PKGS[@]}")"
   if [[ -n "$CMD" ]]; then
     $CMD || warn "Package install failed — open 'amvd' → Dependencies to retry."
   else
@@ -84,7 +87,7 @@ else
   say "All required packages are already installed"
 fi
 
-backend="$(python3 -c 'import core; print(core.Config().resolved_backend() or "")')"
+backend="$("$PY" -c 'import core; print(core.Config().resolved_backend() or "")')"
 case "$backend" in
   gnome)    say "Desktop: GNOME (Wayland)";;
   hyprland) say "Desktop: Hyprland";;
@@ -94,7 +97,7 @@ esac
 
 # ---- 4. firewall: the phone connects in on TCP 5000 over Wi-Fi / tethering
 #         (the USB-debugging path goes through adb on 127.0.0.1 and needs nothing)
-FW="$(python3 -c '
+FW="$("$PY" -c '
 import core
 f = core.firewall_check(core.Config().port)
 print((f["name"] + "|" + " ".join(f["fix"])) if f else "")')"
@@ -103,7 +106,7 @@ if [[ -n "$FW" ]]; then
   if [[ -r /dev/tty ]]; then
     read -r -p "Open it now? [Y/n] " ans </dev/tty || ans=n
     if [[ ! "$ans" =~ ^[Nn] ]]; then
-      if python3 -c 'import core, subprocess, sys
+      if "$PY" -c 'import core, subprocess, sys
 f = core.firewall_check(core.Config().port)
 sys.exit(subprocess.run(f["fix"]).returncode if f else 0)'; then
         say "Port opened"
@@ -118,7 +121,7 @@ fi
 #         virtual touchscreen in /dev/uinput, which is root-only on most distros.
 #         A udev rule grants it to whoever is logged in at the seat (uaccess).
 #         GNOME needs nothing: Mutter's RemoteDesktop API injects the touches.
-TOUCH_FIX="$(python3 -c '
+TOUCH_FIX="$("$PY" -c '
 import core, shlex
 t = core.touch_setup_check(core.Config())
 print(shlex.join(t["fix"]) if t and t["fix"] else "")')"
@@ -128,7 +131,7 @@ if [[ -n "$TOUCH_FIX" ]]; then
   if [[ -r /dev/tty ]]; then
     read -r -p "Set it up now? [Y/n] " ans </dev/tty || ans=n
     if [[ ! "$ans" =~ ^[Nn] ]]; then
-      if python3 -c 'import core, subprocess, sys
+      if "$PY" -c 'import core, subprocess, sys
 t = core.touch_setup_check(core.Config())
 sys.exit(subprocess.run(t["fix"]).returncode if t else 0)'; then
         say "Touch input ready"

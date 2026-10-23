@@ -194,6 +194,8 @@ PC at `10.0.2.2`). More in [`ANDROID.md` §7](docs/ANDROID.md#7-developer-instal
 ```
 linux/
   amvd                  TUI launcher (installed as the `amvd` command)
+  python.sh             picks the system /usr/bin/python3 (not conda/pyenv) for
+                        amvd, start-extender.sh and install.sh
   tui.py                curses UI: deps, detection, config, live view + QR
   core.py               config, distro/dependency detection, addresses, QR URI
   qr.py                 dependency-free QR encoder (half-block terminal output)

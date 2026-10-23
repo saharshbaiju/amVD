@@ -458,7 +458,8 @@ brings it back in line with Hyprland.
 ## 6. Process & lifecycle
 
 ```
-tui.py ──spawns──▶ extenderd.py --keep-output --banner-file …
+amvd (python.sh: /usr/bin/python3) ──▶ tui.py
+tui.py ──spawns──▶ extenderd.py --keep-output --banner-file …   (same interpreter)
                        │
                        ├─ backend.setup()          create the virtual monitor
                        ├─ backend.start_capture()  wf-recorder | gst-launch-1.0  → pipe
@@ -469,6 +470,14 @@ tui.py ──spawns──▶ extenderd.py --keep-output --banner-file …
                                                    remove monitor (unless --keep-output on Hyprland)
 ```
 
+- **Always the system Python.** The launchers (`amvd`, `start-extender.sh`,
+  `install.sh`) source `python.sh`, which picks `/usr/bin/python3` rather than
+  the first `python3` on `PATH`. Distro packages (PyGObject) only exist for the
+  system interpreter, and conda's bundled ncurses can't find the system
+  terminfo database — a conda `python3` first on `PATH` made the GNOME check
+  report `python gi` missing forever and crashed curses at startup. The TUI
+  starts the daemon with `sys.executable`, so both share that interpreter.
+  `tui.setup_terminal()` still recovers when run directly under such a Python.
 - The TUI owns the daemon so it survives leaving the live view. `q` keeps
   streaming; `d` disconnects and removes the monitor. The UI shows
   "Disconnecting…" while it works, so the pause isn't mistaken for a hang.

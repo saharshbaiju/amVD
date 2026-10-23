@@ -15,12 +15,14 @@ set -euo pipefail
 MODE="${1:-usb}"; shift || true
 PORT="${PORT:-5000}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/python.sh"   # the system Python, not whatever python3 is on PATH
+PY="$(amvd_python)" || { echo "python3 is required" >&2; exit 1; }
 
 if [[ "$MODE" != "usb" && "$MODE" != "wifi" ]]; then
   echo "usage: $0 [usb|wifi] [extra extenderd args]"; exit 1
 fi
 
-ASEXT_HERE="$HERE" python3 - "$MODE" "$PORT" <<'EOF'
+ASEXT_HERE="$HERE" "$PY" - "$MODE" "$PORT" <<'EOF'
 import os, sys
 sys.path.insert(0, os.environ["ASEXT_HERE"])
 import core, qr
@@ -42,5 +44,5 @@ EOF
 # The QR carries the pairing key (core.connect_uri creates it on first use); the
 # daemon reads the same file so phones that scanned the QR may use touch.
 KEY_FILE="$HOME/.config/archscreenextender/pairing-key"   # core.PAIRING_KEY_PATH
-exec python3 "${HERE}/extenderd.py" --port "${PORT}" \
+exec "$PY" "${HERE}/extenderd.py" --port "${PORT}" \
   --pairing-key-file "${KEY_FILE}" "$@" </dev/null

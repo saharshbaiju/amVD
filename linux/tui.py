@@ -324,6 +324,11 @@ def deps_screen(win, cfg):
                        "Fedora: openh264 comes from the fedora-cisco-openh264 "
                        "repo (enabled by default on Workstation).",
                        curses.color_pair(5))
+            if not core.system_python():
+                addstr(win, row + 3, 2,
+                       f"Note: running under {sys.executable}; distro packages "
+                       "install into /usr/bin/python3. Start with 'amvd'.",
+                       curses.color_pair(4))
         elif missing:
             addstr(win, row, 2, f"Missing: {', '.join(missing)} "
                                 "(unknown distro — install them manually)",
@@ -785,7 +790,43 @@ def app(stdscr):
                 stream = None
 
 
+# Where distros keep the terminfo database. An interpreter that bundles its own
+# ncurses (conda/miniconda) only looks in its own prefix and can't find it.
+SYSTEM_TERMINFO_DIRS = ("/usr/share/terminfo", "/usr/lib/terminfo",
+                        "/etc/terminfo", "/lib/terminfo")
+
+
+def setup_terminal():
+    """Make sure curses can load a terminfo entry for this terminal.
+
+    `amvd` runs the system Python, whose curses finds the system database.
+    Run directly under conda (`python3 tui.py`), setupterm fails with "could
+    not find terminfo database": point it at the system directories, and if
+    the terminal's entry (e.g. xterm-kitty) still isn't there, fall back to
+    xterm-256color, which every terminal emulator understands well enough.
+    """
+    def loads():
+        try:
+            curses.setupterm(os.environ.get("TERM", "unknown"),
+                             sys.stdout.fileno())
+            return True
+        except curses.error:
+            return False
+
+    if loads():
+        return
+    dirs = [d for d in SYSTEM_TERMINFO_DIRS if os.path.isdir(d)]
+    if os.environ.get("TERMINFO_DIRS"):
+        dirs.insert(0, os.environ["TERMINFO_DIRS"])
+    os.environ["TERMINFO_DIRS"] = ":".join(dirs)
+    if loads():
+        return
+    os.environ["TERM"] = "xterm-256color"
+    loads()   # if even this fails, curses.wrapper reports the real error
+
+
 def main():
+    setup_terminal()
     try:
         curses.wrapper(app)
     except KeyboardInterrupt:

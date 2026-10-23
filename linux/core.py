@@ -19,6 +19,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from urllib.parse import quote
@@ -252,6 +253,18 @@ DEPS = {
          False, "phone size auto-match (needs USB debugging)"),
     ],
 }
+
+
+def system_python() -> bool:
+    """True when running under the distro's /usr/bin/python3 — the interpreter
+    the Python packages above (PyGObject) are installed into. False under
+    conda / pyenv / a venv, where they stay "missing" however often they're
+    installed; the `amvd` launcher (python.sh) always picks the system one."""
+    try:
+        return (os.path.samefile(sys.executable, "/usr/bin/python3")
+                and sys.prefix == sys.base_prefix)   # not a venv
+    except OSError:
+        return True   # no /usr/bin/python3: nothing better to point at
 
 
 def check_dependencies(backend=None) -> list:
